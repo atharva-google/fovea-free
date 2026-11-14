@@ -157,26 +157,44 @@ def select_units(units: List[Unit], smap: Dict[str, Any], target: float, mode: s
         elif smap["hook"]["units"]:
             notes.append("hook not moved (not chosen, or it depends on a setup)")
 
-    pieces: List[Piece] = []
+    # changed: which picture covers which line is decided FIRST, so that a picture shown over a line is
+    # never shown again on its own, and neither is the rest of that shot's silent footage (the experiment
+    # could show both, which reads as the shot repeating).
+    cover: Dict[str, str] = {}
     used = set()
+    if mode == "cutaway":
+        for u in order:
+            if u.kind == "speech" and u.id in overlay_ok:
+                options = [(f, p) for f, p in sorted(overlay_ok[u.id], reverse=True)
+                           if p not in used and p != u.id and by_id[p].dur >= min_cutaway]
+                if options:
+                    cover[u.id] = options[0][1]
+                    used.add(options[0][1])
+    used_shots = {by_id[p].shot for p in used}
+
+    pieces: List[Piece] = []
+    shown: List[str] = []
+    not_again: List[str] = []
     for u in order:
-        if mode == "cutaway" and u.kind == "speech" and u.id in overlay_ok:
-            options = [(f, p) for f, p in sorted(overlay_ok[u.id], reverse=True)
-                       if p not in used and by_id[p].dur >= min_cutaway]
-            if options:
-                _, p = options[0]
-                pu = by_id[p]
-                used.add(p)
-                cut_len = min(pu.dur, u.dur)
-                own = u.dur - cut_len
-                label = f"cutaway: {info[p]['shows']}"
-                if own >= 0.3:   # speaker first, then cut to the picture while the line finishes
-                    pieces.append(Piece(u.start, u.start, own, u.id, "speaker (synced)"))
-                    pieces.append(Piece(pu.start, u.start + own, cut_len, f"{u.id}<-{p}", label))
-                else:
-                    pieces.append(Piece(pu.start, u.start, u.dur, f"{u.id}<-{p}", label))
-                continue
+        if u.id in used or (u.kind == "picture" and u.shot in used_shots):
+            not_again.append(u.id)
+            continue
+        shown.append(u.id)
+        if u.id in cover:
+            p = cover[u.id]
+            pu = by_id[p]
+            cut_len = min(pu.dur, u.dur)
+            own = u.dur - cut_len
+            label = f"cutaway: {info[p]['shows']}"
+            if own >= 0.3:   # speaker first, then cut to the picture while the line finishes
+                pieces.append(Piece(u.start, u.start, own, u.id, "speaker (synced)"))
+                pieces.append(Piece(pu.start, u.start + own, cut_len, f"{u.id}<-{p}", label))
+            else:
+                pieces.append(Piece(pu.start, u.start, u.dur, f"{u.id}<-{p}", label))
+            continue
         pieces.append(Piece(u.start, u.start, u.dur, u.id, info[u.id]["note"][:60]))
+    if not_again:
+        notes.append(f"not shown on their own, their shot already covers a line: {', '.join(not_again)}")
 
     pieces = merge_pieces(pieces, bridge_gap)
     total = round(sum(p.length for p in pieces), 2)
@@ -186,7 +204,7 @@ def select_units(units: List[Unit], smap: Dict[str, Any], target: float, mode: s
         notes.append("nothing worth keeping was found")
     elif not ok:
         notes.append(f"not meaningfully shorter than the source ({total:.1f}s of {source:.1f}s)")
-    stats = {"target": target, "mode": mode, "total": total, "units": [u.id for u in order],
+    stats = {"target": target, "mode": mode, "total": total, "units": shown,
              "arc_units": [i for ids in arc for i in ids], "notes": notes, "ok": ok}
     return pieces, stats
 

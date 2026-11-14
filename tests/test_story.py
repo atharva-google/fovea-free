@@ -151,6 +151,26 @@ class SelectorTest(unittest.TestCase):
         self.assertLessEqual(p.audio_start + p.length, punch.end + 1e-6)
         self.assertNotIn(sweater[0].id, stats["units"])                         # it takes no time of its own
 
+    def test_a_shot_shown_over_a_line_is_not_shown_again(self):
+        units, smap, setup, punch, sweater = example()
+        self.assertGreater(len(sweater), 1)                    # the close-up is two units of one shot
+        for m in smap["units"]:
+            if m["id"] in [u.id for u in sweater]:
+                m["importance"] = 9.0                            # worth keeping on their own too
+        smap["needs"].append({"unit": sweater[0].id, "requires": [punch.id], "why": "in a bundle, so never dropped early"})
+        pieces, stats = select_units(units, smap, 9.0, "cutaway")
+        over = [p for p in pieces if "<-" in p.units]
+        self.assertEqual([p.units for p in over], [f"{punch.id}<-{sweater[0].id}"])
+        on_their_own = " ".join(p.units for p in pieces if "<-" not in p.units).split()
+        for u in sweater:
+            self.assertNotIn(u.id, on_their_own)               # neither the same footage nor the rest of that shot
+            self.assertNotIn(u.id, stats["units"])
+        starts = [round(p.video_start, 2) for p in pieces]
+        self.assertEqual(len(starts), len(set(starts)))        # no picture appears twice
+        self.assertTrue(any("not shown on their own" in n for n in stats["notes"]))
+        # synced mode is untouched: there the close-up plays in its own time
+        self.assertIn(sweater[0].id, select_units(units, smap, 9.0, "synced")[1]["units"])
+
     def test_never_cuts_away_to_someone_visibly_talking(self):
         units, smap, setup, punch, _ = example()
         smap["cutaways"] = [{"speech": punch.id, "pictures": [setup.id], "fit": 9, "why": ""}]
