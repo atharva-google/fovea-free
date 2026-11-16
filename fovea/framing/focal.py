@@ -9,10 +9,12 @@ from __future__ import annotations
 
 import ast
 import re
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
+
+from .subjects import person_score
 
 OcrByFrame = Dict[int, List[Dict[str, float]]]
 
@@ -67,7 +69,9 @@ def extract_frame_candidates(
     motion_results: Dict[int, Dict[str, float]],
     video_w: int,
     video_h: int,
+    presence: Optional[Dict[Any, float]] = None,
 ) -> List[Dict[str, Any]]:
+    """``presence``: share of the shot each track id is on screen for (missing = the whole shot)."""
     candidates = []
     frame_area = float(video_w * video_h)
 
@@ -85,7 +89,8 @@ def extract_frame_candidates(
             score = 2.0 + max(0.0, det.get("asd_score") or 0.0)
             tag = f"speaker_{tid}"
         else:
-            score = 0.60 + 0.30 * min(1.0, area_ratio / 0.25)
+            offset = abs(cx / float(video_w) - 0.5) / 0.5
+            score = person_score(area_ratio, offset, (presence or {}).get(tid, 1.0))
             tag = f"person_{tid}"
         candidates.append({"cx": cx, "score": score, "tag": tag, "type": "person"})
 
@@ -131,8 +136,15 @@ def optimize_shot_focal_path(
     if T == 0:
         return []
 
+    seen: Dict[Any, int] = {}                 # how long each person is on screen in this shot
+    for f in shot_frames:
+        for det in frames_data.get(f, []):
+            if det.get("cname") == "person":
+                seen[det["track_id"]] = seen.get(det["track_id"], 0) + 1
+    presence = {tid: n / float(T) for tid, n in seen.items()}
+
     frame_candidates = [
-        extract_frame_candidates(f, t, frames_data, ocr_by_frame, motion_results, video_w, video_h)
+        extract_frame_candidates(f, t, frames_data, ocr_by_frame, motion_results, video_w, video_h, presence)
         for t, f in enumerate(shot_frames)
     ]
 

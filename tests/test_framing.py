@@ -37,6 +37,13 @@ class WhatTheCameraFollowsTest(unittest.TestCase):
         self.assertEqual(kinds([]), ["ocr"])
         self.assertEqual(kinds([], shot_rel_idx=40), ["ocr"])
 
+    def test_among_silent_people_the_central_one_who_stays_wins(self):
+        centre = {**person(x=600, size=80), "track_id": 1}
+        edge = {**person(x=1180, size=80), "track_id": 2}
+        c = extract_frame_candidates(0, 0, {0: [edge, centre]}, {}, {}, W, H, presence={1: 1.0, 2: 0.2})
+        best = max(c, key=lambda x: x["score"])
+        self.assertEqual(best["tag"], "person_1")
+
     def test_with_nothing_at_all_the_camera_stays_in_the_middle(self):
         c = extract_frame_candidates(5, 0, {}, TEXT, {}, W, H)           # frame 5: no people, no text
         self.assertEqual([(x["type"], x["cx"]) for x in c], [("fallback", W / 2)])
