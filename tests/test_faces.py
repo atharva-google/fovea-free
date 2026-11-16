@@ -102,5 +102,45 @@ class AssembleTest(unittest.TestCase):
         self.assertEqual({d["track_id"] for f in out for d in out[f]}, {1})
 
 
+def person(tid, bbox, face_box):
+    return {"track_id": tid, "cname": "person", "bbox": bbox, "conf": 0.8, "face_bbox": face_box, "face_conf": 0.9}
+
+
+class AddMissedFacesTest(unittest.TestCase):
+    def test_what_was_already_found_is_left_exactly_as_it_was(self):
+        known = person(3, [350, 50, 900, 720], [500, 100, 700, 300])
+        frames = {0: {"dets": [known], "full": [face(505, 105, 190, 0.95)]}}     # the same face, seen again
+        self.assertEqual(faces.add_missed_faces(frames)[0], [known])
+
+    def test_a_close_up_with_no_person_box_is_added_and_keeps_one_id_over_the_shot(self):
+        frames = {f: {"dets": [], "full": [face(300 + f, 40, 620)]} for f in range(531, 557, 2)}
+        out = faces.add_missed_faces(frames)
+        ids = {d["track_id"] for dets in out.values() for d in dets}
+        self.assertEqual(ids, {faces.MISSED_ID0})
+        d = out[531][0]
+        self.assertEqual((d["cname"], d["bbox"], d["face_bbox"]), ("person", [300 + 531, 40, 920 + 531, 660], [300 + 531, 40, 920 + 531, 660]))
+
+    def test_a_person_whose_face_was_missed_in_their_box_gets_it_and_keeps_their_track(self):
+        missed = {"track_id": 3, "cname": "body", "bbox": [0, 23, 894, 696], "conf": 0.76}
+        other = person(1, [0, 121, 238, 647], [20, 260, 180, 430])
+        frames = {0: {"dets": [other, missed], "full": [face(330, 60, 500), face(25, 265, 150)]}}
+        out = faces.add_missed_faces(frames)[0]
+        self.assertEqual([(d["track_id"], d["cname"]) for d in out], [(1, "person"), (3, "person")])
+        self.assertEqual(out[1]["face_bbox"], [330, 60, 830, 560])
+        self.assertEqual(out[1]["bbox"], [0, 23, 894, 696])
+        self.assertEqual(out[0], other)
+
+    def test_bodies_and_objects_without_a_new_face_pass_through(self):
+        dets = [{"track_id": 7, "cname": "body", "bbox": [100, 100, 300, 700], "conf": 0.6},
+                {"track_id": 9, "cname": "cell phone", "bbox": [186, 24, 1062, 690], "conf": 0.7}]
+        self.assertEqual(faces.add_missed_faces({0: {"dets": dets, "full": []}})[0], dets)
+
+    def test_the_input_is_not_changed(self):
+        missed = {"track_id": 3, "cname": "body", "bbox": [0, 0, 900, 700], "conf": 0.7}
+        frames = {0: {"dets": [missed], "full": [face(300, 60, 500)]}}
+        faces.add_missed_faces(frames)
+        self.assertEqual(missed["cname"], "body")
+
+
 if __name__ == "__main__":
     unittest.main()

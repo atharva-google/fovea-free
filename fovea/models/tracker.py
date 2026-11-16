@@ -1,25 +1,30 @@
-"""Faces, people and objects per shot, for many shots at once.
+"""Person tracking with face boxes, for many shots at once.
 
-How a shard is analysed (``PersonTracker.track_shots``):
+How a shard is tracked (``PersonTracker.track_shots``):
   * several decoder threads each read a different run of shots from the proxy and push the
-    frames the detectors need (every ``detect_every``-th frame of a shot) into one queue
+    frames the detector needs (every ``detect_every``-th frame of a shot) into one queue
   * the main thread takes frames from that queue in **batches that may mix shots** and runs ONE
-    YOLO forward pass per batch (FP16 on CUDA): people (kept as a fallback) and objects
-  * FACES are found on the WHOLE frame by MediaPipe (CPU, in a thread pool, overlapping with the
-    following YOLO batches): the short-range model for close-ups and the full-range model for the
-    rest. A face no longer needs a YOLO person box around it, so a close-up with no body is found.
-    ``face_backend="pose"`` instead takes faces from the head keypoints of a YOLO-pose model.
-  * per shot, faces are merged, given a margin and linked into tracks by our own linker
-    (``faces.py``; there is no ByteTrack any more)
-  * frames the detectors skipped are filled by interpolating each track (``fill_skipped_frames``)
+    YOLO forward pass per batch (FP16 on CUDA). Detection is stateless, so mixing shots is safe.
+  * every detection is routed to the ByteTrack instance of ITS shot. One decoder reads a shot
+    from start to end, so a shot's frames always arrive in order (ByteTrack needs that).
+  * MediaPipe face detection (CPU) on each person crop runs in a thread pool, overlapping with
+    the following YOLO batches. ``face_backend="pose"`` instead takes the face from the head
+    keypoints of a YOLO-pose model, in the same GPU pass.
+  * IN ADDITION, MediaPipe looks for faces on the WHOLE frame (short-range model for close-ups +
+    the full-range one). Such a face is used ONLY where the steps above found no face: a close-up
+    with no body for YOLO to find, or a person whose face was missed inside their box. Everything
+    the old path finds is kept exactly as it was, so speaker detection sees the same face tracks.
+  * frames the detector skipped are filled by interpolating each track (``fill_skipped_frames``)
 
 Output structure (``ShotTracks``)::
 
     {shot_id: {frame_idx: [ detections ]}}
 
-    {track_id, cname: "person", bbox, conf, face_bbox, face_conf, sharp}   a face (bbox = its body, if YOLO saw one)
-    {track_id, cname: "body", bbox, conf}                                 a person with no visible face
+    {track_id, cname: "person", bbox, conf, face_bbox, face_conf, sharp}   a person with a face
+    {track_id, cname: "body", bbox, conf}                                 a person with no face found
     {track_id, cname: <yolo class>, bbox, conf}                           an object
+
+Faces added from the whole frame have track ids from 5000 (linked by ``faces.Linker``).
 """
 
 from __future__ import annotations
@@ -35,12 +40,39 @@ import cv2
 import numpy as np
 
 from ..utils.video import ShotReader, split_contiguous
-from .faces import assemble_shot
+from .faces import add_missed_faces
 
 ShotTracks = Dict[int, Dict[int, List[Dict[str, Any]]]]
 FrameTracks = Dict[int, List[Dict[str, Any]]]
 
 _DONE = object()
+
+
+def _make_bytetrack(frame_rate: int):
+    """Build Ultralytics' ByteTrack directly so we can feed it batched detections."""
+    from ultralytics.trackers.byte_tracker import BYTETracker
+    from ultralytics.utils import IterableSimpleNamespace
+    from ultralytics.utils.checks import check_yaml
+
+    path = check_yaml("bytetrack.yaml")
+    try:  # newer ultralytics
+        from ultralytics.utils import YAML
+
+        cfg = YAML.load(path)
+    except ImportError:  # older ultralytics
+        from ultralytics.utils import yaml_load
+
+        cfg = yaml_load(path)
+
+    import inspect
+
+    if "frame_rate" in inspect.signature(BYTETracker.__init__).parameters:  # older ultralytics
+        return BYTETracker(args=IterableSimpleNamespace(**cfg), frame_rate=frame_rate)
+    # Newer ultralytics dropped ``frame_rate`` and uses ``track_buffer`` as-is. Older versions kept
+    # lost tracks for ``track_buffer * frame_rate / 30`` frames, so apply that scaling here to keep
+    # the same behaviour (we track at fps / detect_every, not 30 fps).
+    cfg["track_buffer"] = max(1, int(frame_rate / 30.0 * cfg.get("track_buffer", 30)))
+    return BYTETracker(args=IterableSimpleNamespace(**cfg))
 
 
 class PersonTracker:
@@ -56,7 +88,7 @@ class PersonTracker:
         face_min_conf: float = 0.5,
         detect_every: int = 1,
         face_short_model_path: Optional[str] = None,
-        face_margin: float = 0.15,
+        face_margin: float = 0.0,
     ):
         from ultralytics import YOLO
 
@@ -67,16 +99,15 @@ class PersonTracker:
         self.conf, self.iou = conf, iou
         self.face_backend = face_backend
         self.face_model_path = face_model_path
-        # short-range first (close-ups), then full-range; the same face found by both is merged later
-        self.face_model_paths = [str(p) for p in (face_short_model_path, face_model_path) if p]
+        # whole-frame face search: short-range first (close-ups), then full-range
+        self.full_frame_models = [str(p) for p in (face_short_model_path, face_model_path) if p]
         self.face_margin = face_margin
-        self.frame_size: Optional[Tuple[int, int]] = None
         self.face_min_conf = face_min_conf
         self.detect_every = max(1, int(detect_every))
         self.frame_rate = max(1, int(round(fps / self.detect_every)))
         self._face_local = threading.local()  # one MediaPipe detector per face thread
         self._lock = threading.Lock()
-        self.seconds = {"decode_wait": 0.0, "yolo": 0.0, "link": 0.0, "faces_cpu": 0.0, "faces_wait": 0.0}
+        self.seconds = {"decode_wait": 0.0, "yolo": 0.0, "bytetrack": 0.0, "faces_cpu": 0.0, "faces_wait": 0.0}
 
     # ------------------------------------------------------------- public API
     def track_shots(self, video_path: str, shots: Sequence[Dict[str, Any]], batch_size: int = 16,
@@ -137,7 +168,8 @@ class PersonTracker:
 
         face_pool = (ThreadPoolExecutor(max_workers=max(1, face_workers), thread_name_prefix="faces")
                      if self.face_backend == "mediapipe" else None)
-        max_pending_faces = min(max_pending_faces, 64)  # each pending job holds a whole frame
+        bytetracks: Dict[int, Any] = {}
+        max_pending_faces = min(max_pending_faces, 96)  # whole-frame face jobs each hold a frame
         pending: deque = deque()  # face futures not yet known to be finished (bounded)
         try:
             batch: List[Tuple[int, int, np.ndarray]] = []
@@ -153,21 +185,21 @@ class PersonTracker:
                     raise item
                 batch.append(item)
                 if len(batch) >= batch_size:
-                    self._process_batch(batch, raw, face_pool, pending, max_pending_faces)
+                    self._process_batch(batch, bytetracks, raw, face_pool, pending, max_pending_faces)
                     if on_frames:
                         on_frames(len(batch))
                     batch = []
             if batch:
-                self._process_batch(batch, raw, face_pool, pending, max_pending_faces)
+                self._process_batch(batch, bytetracks, raw, face_pool, pending, max_pending_faces)
                 if on_frames:
                     on_frames(len(batch))
             t0 = time.perf_counter()
-            resolved = {sid: {idx: _resolve(entry) for idx, entry in frames.items()} for sid, frames in raw.items()}
+            result = {}
+            for sid, frames in raw.items():
+                resolved = {idx: {"dets": _resolve(e["dets"]), "full": e["full"].result() if e["full"] is not None else []}
+                            for idx, e in frames.items()}
+                result[sid] = add_missed_faces(resolved)
             self.seconds["faces_wait"] += time.perf_counter() - t0
-            t0 = time.perf_counter()
-            w, h = self.frame_size or (0, 0)
-            result = {sid: assemble_shot(frames, w, h, self.face_margin) for sid, frames in resolved.items()}
-            self.seconds["link"] += time.perf_counter() - t0
             return result
         finally:
             stop.set()
@@ -180,66 +212,82 @@ class PersonTracker:
                 face_pool.shutdown(wait=True, cancel_futures=True)
 
     # ------------------------------------------------------------- internals
-    def _process_batch(self, batch, raw, face_pool, pending: deque, max_pending: int) -> None:
+    def _process_batch(self, batch, bytetracks, raw, face_pool, pending: deque, max_pending: int) -> None:
         t0 = time.perf_counter()
         extra = {"half": True} if self.half else {}  # passing half=False only triggers a deprecation warning
         results = self.model.predict(
             source=[img for _, _, img in batch], conf=self.conf, iou=self.iou,
             device=self.device, verbose=False, **extra,
         )
-        self.seconds["yolo"] += time.perf_counter() - t0
+        t1 = time.perf_counter()
+        self.seconds["yolo"] += t1 - t0
 
         for (sid, frame_idx, img), res in zip(batch, results):
-            h, w = img.shape[:2]
-            self.frame_size = (w, h)
             det = res.boxes.cpu().numpy()
-            kpts = res.keypoints.data.cpu().numpy() if getattr(res, "keypoints", None) is not None else None
-            yolo: List[Dict[str, Any]] = []
-            pose_faces: List[Tuple[List[int], float, float]] = []
-            for i in range(len(det)):
-                x1, y1, x2, y2 = (int(v) for v in det.xyxy[i][:4])
-                x1, y1, x2, y2 = max(0, x1), max(0, y1), min(w, x2), min(h, y2)
-                if x2 <= x1 or y2 <= y1:
-                    continue
-                cname = res.names[int(det.cls[i])]
-                yolo.append({"bbox": [x1, y1, x2, y2], "conf": float(det.conf[i]),
-                             "cname": "body" if cname == "person" else cname})
-                if cname == "person" and self.face_backend == "pose" and kpts is not None:
-                    face = _face_from_keypoints(kpts[i], [x1, y1, x2, y2], w, h)
-                    if face is not None:
-                        fx1, fy1, fx2, fy2 = face[0]
-                        pose_faces.append((face[0], face[1], _sharpness(img[fy1:fy2, fx1:fx2])))
-            if face_pool is not None:
-                faces: Any = face_pool.submit(self._mediapipe_faces, img)   # the WHOLE frame, not person crops
-                pending.append(faces)
-            else:
-                faces = pose_faces
-            raw[sid][frame_idx] = {"faces": faces, "yolo": yolo}
+            current: List[Any] = []
+            if len(det):
+                tracker = bytetracks.get(sid)
+                if tracker is None:  # fresh tracker per shot so IDs don't leak across cuts
+                    tracker = bytetracks[sid] = _make_bytetrack(self.frame_rate)
+                tracks = tracker.update(det, img)
+                kpts = res.keypoints.data.cpu().numpy() if getattr(res, "keypoints", None) is not None else None
+                h, w = img.shape[:2]
+                for t in tracks:
+                    # tracks rows: x1, y1, x2, y2, track_id, score, cls, det_index
+                    box = [int(v) for v in t[:4]]
+                    tid, score, cls_id, det_idx = int(t[4]), float(t[5]), int(t[6]), int(t[7])
+                    cname = res.names[cls_id]
+                    if cname != "person":
+                        current.append({"track_id": tid, "bbox": box, "conf": score, "cname": cname})
+                        continue
+                    x1, y1, x2, y2 = max(0, box[0]), max(0, box[1]), min(w, box[2]), min(h, box[3])
+                    if x2 <= x1 or y2 <= y1:
+                        continue
+                    base = {"track_id": tid, "bbox": [x1, y1, x2, y2], "conf": score, "cname": "person"}
+                    if self.face_backend == "pose":
+                        face = _face_from_keypoints(kpts[det_idx], base["bbox"], w, h) if kpts is not None else None
+                        if face is not None:
+                            fx1, fy1, fx2, fy2 = face[0]
+                            current.append({**base, "face_bbox": face[0], "face_conf": face[1],
+                                            "sharp": _sharpness(img[fy1:fy2, fx1:fx2])})
+                        else:
+                            current.append({**base, "cname": "body"})
+                    else:
+                        crop = np.ascontiguousarray(img[y1:y2, x1:x2])  # copy: don't keep the frame alive
+                        fut = face_pool.submit(self._mediapipe_face, crop, x1, y1)
+                        current.append((fut, base))
+                        pending.append(fut)
+            full = None
+            if face_pool is not None and self.full_frame_models:
+                full = face_pool.submit(self._full_frame_faces, img)
+                pending.append(full)
+            raw[sid][frame_idx] = {"dets": current, "full": full}
 
-        # keep the number of in-flight face jobs bounded (each holds a frame)
+        # keep the number of in-flight face crops bounded (memory)
         while len(pending) > max_pending:
             f0 = time.perf_counter()
             pending.popleft().result()
             self.seconds["faces_wait"] += time.perf_counter() - f0
         while pending and pending[0].done():
             pending.popleft()
+        self.seconds["bytetrack"] += time.perf_counter() - t1
 
-    def _mediapipe_faces(self, img: np.ndarray) -> List[Tuple[List[int], float, float]]:
-        """Every face on the frame, from each face model: ``[(box, score, sharpness)]``."""
+    def _full_frame_faces(self, img: np.ndarray) -> List[Tuple[List[int], float, float]]:
+        """Every face on the whole frame, from each model: ``[(box, score, sharpness)]``."""
         t0 = time.perf_counter()
         try:
             import mediapipe as mp
 
-            detectors = getattr(self._face_local, "detectors", None)
+            detectors = getattr(self._face_local, "full_detectors", None)
             if detectors is None:
                 from mediapipe.tasks.python import BaseOptions, vision
 
-                detectors = self._face_local.detectors = [
+                detectors = self._face_local.full_detectors = [
                     vision.FaceDetector.create_from_options(vision.FaceDetectorOptions(
                         base_options=BaseOptions(model_asset_path=path),
                         running_mode=vision.RunningMode.IMAGE,
                         min_detection_confidence=self.face_min_conf,
-                    )) for path in self.face_model_paths]
+                    )) for path in self.full_frame_models]
             h, w = img.shape[:2]
             image = mp.Image(image_format=mp.ImageFormat.SRGB,
                              data=np.ascontiguousarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB)))
@@ -257,14 +305,24 @@ class PersonTracker:
             with self._lock:
                 self.seconds["faces_cpu"] += time.perf_counter() - t0
 
+    def _mediapipe_face(self, crop: np.ndarray, ox: int, oy: int) -> Optional[Tuple[List[int], float, float]]:
+        t0 = time.perf_counter()
+        try:
+            detector = getattr(self._face_local, "detector", None)
+            if detector is None:
+                from mediapipe.tasks.python import BaseOptions, vision
 
-def _sharpness(crop: np.ndarray) -> float:
-    """How in-focus a face is: edge energy of the crop at a fixed small size (so big and small faces
-    compare). A blurred background face scores far below the in-focus subject."""
-    if crop.size == 0:
-        return 0.0
-    gray = cv2.cvtColor(cv2.resize(crop, (64, 64), interpolation=cv2.INTER_AREA), cv2.COLOR_BGR2GRAY)
-    return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+                detector = self._face_local.detector = vision.FaceDetector.create_from_options(
+                    vision.FaceDetectorOptions(
+                        base_options=BaseOptions(model_asset_path=str(self.face_model_path)),
+                        running_mode=vision.RunningMode.IMAGE,
+                        min_detection_confidence=self.face_min_conf,
+                    )
+                )
+            return _face_from_mediapipe_crop(crop, ox, oy, detector)
+        finally:
+            with self._lock:
+                self.seconds["faces_cpu"] += time.perf_counter() - t0
 
 
 def _quiet_half_warning() -> None:
@@ -280,10 +338,51 @@ def _quiet_half_warning() -> None:
         log.addFilter(_Drop())
 
 
-def _resolve(entry: Dict[str, Any]) -> Dict[str, Any]:
-    """Wait for a frame's face job (if it is one) and return ``{"faces": [...], "yolo": [...]}``."""
-    faces = entry["faces"]
-    return {"faces": faces.result() if hasattr(faces, "result") else faces, "yolo": entry["yolo"]}
+def _sharpness(crop: np.ndarray) -> float:
+    """How in-focus a face is: edge energy of the crop at a fixed small size (so big and small faces
+    compare). A blurred background face scores far below the in-focus subject."""
+    if crop.size == 0:
+        return 0.0
+    gray = cv2.cvtColor(cv2.resize(crop, (64, 64), interpolation=cv2.INTER_AREA), cv2.COLOR_BGR2GRAY)
+    return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+
+
+def _resolve(entries: List[Any]) -> List[Dict[str, Any]]:
+    """Turn (face_future, person_dict) placeholders into final detections (in original order).
+    A person whose face was not found is kept as a ``body`` (it used to be dropped)."""
+    out = []
+    for e in entries:
+        if isinstance(e, tuple):
+            fut, base = e
+            face = fut.result()
+            if face is not None:
+                out.append({**base, "face_bbox": face[0], "face_conf": face[1], "sharp": face[2]})
+            else:
+                out.append({**base, "cname": "body"})
+        else:
+            out.append(e)
+    return out
+
+
+def _face_from_mediapipe_crop(crop: np.ndarray, px1: int, py1: int,
+                              detector) -> Optional[Tuple[List[int], float, float]]:
+    import mediapipe as mp
+
+    h, w = crop.shape[:2]
+    res = detector.detect(mp.Image(image_format=mp.ImageFormat.SRGB,
+                                   data=np.ascontiguousarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))))
+    if not res.detections:
+        return None
+    # Face closest to where a head usually is (top-center of the body box)
+    tx, ty = w * 0.5, h * 0.2
+    best = min(res.detections, key=lambda d: (
+        (d.bounding_box.origin_x + d.bounding_box.width * 0.5 - tx) ** 2
+        + (d.bounding_box.origin_y + d.bounding_box.height * 0.5 - ty) ** 2))
+    bb = best.bounding_box
+    fx1, fy1 = max(0, bb.origin_x), max(0, bb.origin_y)
+    fx2, fy2 = min(w, fx1 + bb.width), min(h, fy1 + bb.height)
+    return ([px1 + fx1, py1 + fy1, px1 + fx2, py1 + fy2], float(best.categories[0].score),
+            _sharpness(crop[fy1:fy2, fx1:fx2]))
 
 
 def _face_from_keypoints(kpts: np.ndarray, box, frame_w: int, frame_h: int,

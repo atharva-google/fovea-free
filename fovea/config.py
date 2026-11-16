@@ -112,7 +112,7 @@ class PipelineConfig:
     yolo_conf: float = 0.25
     yolo_iou: float = 0.5
     face_min_conf: float = 0.5
-    face_margin: float = 0.15  # grow each face box by this share of its size (MediaPipe boxes are tight; TalkNet needs the chin)
+    face_margin: float = 0.0  # grow faces found by the whole-frame search by this share of their size (0 = as detected)
 
     # -------------------------------------------------------------------- OCR
     enable_ocr: bool = True

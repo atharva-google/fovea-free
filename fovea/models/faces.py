@@ -1,4 +1,8 @@
-"""Faces found on the whole frame, linked into tracks by our own simple linker (no ByteTrack).
+"""Helpers for faces: merging, margins, a simple frame-to-frame linker, and adding the faces that
+only a whole-frame search finds (``add_missed_faces``, used by ``tracker.py``).
+
+``assemble_shot`` is the experiment that replaced the person-box path and ByteTrack entirely; it is
+not used any more (speaker detection got worse with it) and is kept only for reference.
 
 Plain Python (no numpy / mediapipe), tested in tests/test_faces.py. The models are run in
 ``tracker.py``; this file turns their raw boxes into the detections the rest of the pipeline uses.
@@ -122,5 +126,42 @@ def assemble_shot(frames, frame_w, frame_h, margin=0.15):
             dets.append({"track_id": tid, "cname": "body", "bbox": list(d["bbox"]), "conf": float(d["conf"])})
         for d, tid in zip(objects, objects_l.update(f, [d["bbox"] for d in objects])):
             dets.append({"track_id": tid, "cname": d["cname"], "bbox": list(d["bbox"]), "conf": float(d["conf"])})
+        out[f] = dets
+    return out
+
+
+MISSED_ID0 = 5000     # track ids of faces added from the whole-frame search
+
+
+def add_missed_faces(frames, margin=0.0, frame_w=0, frame_h=0):
+    """Add the faces that only the whole-frame search found. Everything already detected is kept as is.
+
+    ``frames``: ``{frame_idx: {"dets": [detections from the person-box path], "full": [(box, score,
+    sharpness)] from the whole frame}}`` for ONE shot. A whole-frame face is added only if no face is
+    there already (neither box holds the other's centre). If it lies inside a ``body`` (a person whose
+    face was missed in their box) that body becomes a person with this face and keeps its track id;
+    otherwise it is a new person, linked from frame to frame with ids from ``MISSED_ID0``.
+    Returns ``{frame_idx: [detections]}``."""
+    link = Linker(MISSED_ID0)
+    out = {}
+    for f in sorted(frames):
+        dets = [dict(d) for d in frames[f].get("dets") or []]
+        known = [d["face_bbox"] for d in dets if d.get("face_bbox") is not None]
+        new = []
+        for box, score, sharp in merge_faces(frames[f].get("full") or []):
+            if any(_inside(_centre(box), k) or _inside(_centre(k), box) or iou(box, k) >= 0.3 for k in known):
+                continue
+            if margin and frame_w and frame_h:
+                box = expand_box(box, margin, frame_w, frame_h)
+            bodies = [d for d in dets if d.get("cname") == "body" and _inside(_centre(box), d["bbox"])]
+            if bodies:
+                body = min(bodies, key=lambda d: area(d["bbox"]))
+                body.update({"cname": "person", "face_bbox": list(box), "face_conf": float(score), "sharp": float(sharp)})
+            else:
+                new.append((box, score, sharp))
+            known.append(box)
+        for (box, score, sharp), tid in zip(new, link.update(f, [x[0] for x in new])):
+            dets.append({"track_id": tid, "cname": "person", "bbox": list(box), "conf": float(score),
+                         "face_bbox": list(box), "face_conf": float(score), "sharp": float(sharp)})
         out[f] = dets
     return out
