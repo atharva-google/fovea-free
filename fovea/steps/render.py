@@ -26,6 +26,7 @@ import numpy as np
 import pandas as pd
 
 from ..config import PipelineConfig
+from ..framing.subjects import drop_faces_on_text
 from ..framing import (CropGeometry, OutputTarget, find_focal_points_rules, find_focal_points_viterbi, plan_camera,
                        split_logos)
 from ..models.ocr import records_to_df
@@ -44,7 +45,11 @@ def run(job: JobDir, cfg: PipelineConfig, log=print, progress: Optional[Progress
     src, proxy, _ = job.video_infos()
     shots = pd.read_csv(job.shots)
     data = merge_shards(job)
-    tracks = attach_speaking_scores(data["tracks"], data["speaker_scores"])
+    # a "face" that only the whole-frame search found and that sits on on-screen text is a logo, not a face
+    faces, not_faces = drop_faces_on_text(data["tracks"], data["ocr"], proxy.width, proxy.height)
+    if not_faces:
+        log(f"  {len(not_faces)} face detection(s) on top of on-screen text ignored (a logo read as a face)")
+    tracks = attach_speaking_scores(faces, data["speaker_scores"])
     ocr = records_to_df(data["ocr"])
     # Pre-check before any crop centre is computed: a logo that sits in the same place in several shots is
     # set aside (framing/logos.csv) and never reaches the framing.

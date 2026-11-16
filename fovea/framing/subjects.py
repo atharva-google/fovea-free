@@ -138,6 +138,50 @@ def fill_track_gaps(frames_data, shot_frames, max_gap=25):
     return out
 
 
+def drop_faces_on_text(shot_tracks, text_records, frame_w, frame_h, min_id=5000, grow=0.25):
+    """A "face" that sits on on-screen text is not a face: the whole-frame face search can mistake a
+    logo for one. Removes detections with ``track_id >= min_id`` (faces that ONLY the whole-frame
+    search found) whose face centre lies inside a text box of the same shot (boxes grown by ``grow``).
+    A logo (text at the same place in several shots) counts in EVERY shot, also those where the text
+    reader did not catch it.
+
+    ``shot_tracks``: ``{shot_id: {frame: [detections]}}``; ``text_records``: the stored OCR records
+    (``shot_id`` + ``text_box_vertices`` as shares of the frame). Returns ``(tracks, removed ids)``."""
+    boxes, parsed = {}, []
+    for r in text_records:
+        pts = r.get("text_box_vertices") or []
+        if len(pts) < 2:
+            continue
+        xs, ys = [p[0] * frame_w for p in pts], [p[1] * frame_h for p in pts]
+        w, h = (max(xs) - min(xs)) * grow, (max(ys) - min(ys)) * grow
+        box = (min(xs) - w, min(ys) - h, max(xs) + w, max(ys) + h)
+        boxes.setdefault(int(r["shot_id"]), []).append(box)
+        parsed.append((box, (int(r["shot_id"]), (min(xs) + max(xs)) / 2.0 / frame_w, (min(ys) + max(ys)) / 2.0 / frame_h)))
+    logos = watermark_indices([where for _, where in parsed])
+    everywhere = [box for k, (box, _) in enumerate(parsed) if k in logos]
+
+    def on_text(shot, d):
+        b = d.get("face_bbox")
+        if b is None or not isinstance(d.get("track_id"), int) or d["track_id"] < min_id:
+            return False
+        cx, cy = (b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0
+        return any(x1 <= cx <= x2 and y1 <= cy <= y2 for x1, y1, x2, y2 in boxes.get(int(shot), []) + everywhere)
+
+    removed = set()
+    out = {}
+    for shot, frames in shot_tracks.items():
+        out[shot] = {}
+        for f, dets in frames.items():
+            keep = []
+            for d in dets:
+                if on_text(shot, d):
+                    removed.add((int(shot), d["track_id"]))
+                else:
+                    keep.append(d)
+            out[shot][f] = keep
+    return out, removed
+
+
 def watermark_indices(boxes, n_shots=None, tol=0.04, min_shots=3, min_share=0.0):
     """Text that sits in the same place in many shots is a logo / watermark, not something to look at.
 

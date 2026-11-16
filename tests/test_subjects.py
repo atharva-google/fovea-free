@@ -5,7 +5,7 @@
 
 import unittest
 
-from fovea.framing.subjects import (fill_track_gaps, person_score, shot_motion_cx, speaker_score,
+from fovea.framing.subjects import (drop_faces_on_text, fill_track_gaps, person_score, shot_motion_cx, speaker_score,
                                     speaking_frames, watermark_indices)
 
 
@@ -132,6 +132,36 @@ class GapsTest(unittest.TestCase):
         self.assertEqual(out[30], [])
         self.assertFalse(out[10][0]["speaking"])                     # borrowed for the first 25 frames only
         self.assertEqual(out[26], [])
+
+
+class FaceOnLogoTest(unittest.TestCase):
+    LOGO = [{"shot_id": 19, "text_box_vertices": [(0.066, 0.08), (0.145, 0.08), (0.145, 0.17), (0.066, 0.17)]}]
+
+    def tracks(self, tid, face_box):
+        hero = {"track_id": 2, "cname": "person", "bbox": [300, 50, 900, 700], "face_bbox": [520, 150, 760, 390]}
+        d = {"track_id": tid, "cname": "person", "bbox": face_box, "face_bbox": face_box}
+        return {19: {600: [hero, d], 601: [hero, dict(d)]}}
+
+    def test_a_whole_frame_face_sitting_on_the_logo_is_removed(self):
+        got, removed = drop_faces_on_text(self.tracks(5001, [90, 60, 180, 120]), self.LOGO, 1280, 720)
+        self.assertEqual(removed, {(19, 5001)})
+        self.assertEqual([[d["track_id"] for d in dets] for dets in got[19].values()], [[2], [2]])
+
+    def test_a_real_tracked_face_is_never_removed_even_next_to_text(self):
+        got, removed = drop_faces_on_text(self.tracks(13, [90, 60, 180, 120]), self.LOGO, 1280, 720)
+        self.assertEqual(removed, set())
+        self.assertEqual(len(got[19][600]), 2)
+
+    def test_a_whole_frame_face_away_from_text_stays_and_other_shots_are_untouched(self):
+        got, removed = drop_faces_on_text(self.tracks(5000, [300, 200, 420, 320]), self.LOGO, 1280, 720)
+        self.assertEqual(removed, set())
+        tracks = {7: {1: [{"track_id": 5003, "cname": "person", "bbox": [90, 60, 180, 120], "face_bbox": [90, 60, 180, 120]}]}}
+        self.assertEqual(drop_faces_on_text(tracks, self.LOGO, 1280, 720)[1], set())      # the text is in shot 19 only
+
+    def test_a_logo_seen_in_several_shots_counts_in_shots_where_it_was_not_read(self):
+        logo = [{"shot_id": s, "text_box_vertices": self.LOGO[0]["text_box_vertices"]} for s in (13, 14, 15)]
+        got, removed = drop_faces_on_text(self.tracks(5001, [90, 60, 180, 120]), logo, 1280, 720)
+        self.assertEqual(removed, {(19, 5001)})
 
 
 class WatermarkTest(unittest.TestCase):
