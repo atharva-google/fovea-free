@@ -11,6 +11,8 @@ from fovea.story import describe as call1
 from fovea.story import edit_plan as call2
 
 from test_describe import answer, pieces
+from fovea.story.pieces import cut_pieces
+
 from test_pieces import TALK
 
 
@@ -52,7 +54,68 @@ class PromptTest(unittest.TestCase):
         self.assertIn("V01 | 4.00s | CAN COVER up to 1.3s |", text)             # only her silent reaction
         busy = call2.cutaway_prompt(audio, video, described, [10], [(0.0, 3.5)])
         self.assertIn("V01 | 4.00s | cannot cover (a face is talking) |", busy)
-        self.assertIn(f"{sweater} | 1.11s | over V02 | heard: A sweater. | needs {hope}", text)
+        self.assertIn(f"{sweater} | 1.11s | own picture V02 | heard: A sweater. | needs {hope}", text)
+
+
+# The case from a real ad: a closing voiceover runs, without a pause, over the last two shots.
+VO_SHOTS = [(0.0, 4.0), (4.0, 8.0), (8.0, 11.0)]
+VO_WORDS = [{"start": 1.0, "end": 2.0, "word": "Skincare!"},
+            *[{"start": 6.0 + 0.5 * i, "end": 6.5 + 0.5 * i, "word": f"w{i}"} for i in range(10)]]   # 6.0 - 11.0
+
+
+def voiceover():
+    audio, video = cut_pieces(VO_SHOTS, VO_WORDS)
+    described, _ = call1.clean({}, audio, video)
+    line = next(a.id for a in audio if a.text == "Skincare!")
+    vo = next(a.id for a in audio if a.text.startswith("w0"))
+    return audio, video, described, line, vo
+
+
+class SlotsTest(unittest.TestCase):
+    def test_a_sound_running_over_two_shots_is_one_slot_per_shot(self):
+        audio, video, described, line, vo = voiceover()
+        slots = {s["id"]: s for s in call2.make_slots(audio, video)}
+        self.assertIn(line, slots)                                    # over one shot: keeps its id
+        self.assertEqual((slots[vo + "a"]["shot"], slots[vo + "b"]["shot"]), ("V02", "V03"))
+        self.assertAlmostEqual(slots[vo + "a"]["end"], 8.0)
+        self.assertAlmostEqual(slots[vo + "b"]["start"], 8.0)
+        text = call2.cutaway_prompt(audio, video, described, [6])
+        self.assertIn(f"{vo}b | 3.00s | own picture V03 | heard: (the same sound continues)", text)
+
+    def test_a_sliver_of_sound_past_a_cut_does_not_become_a_slot(self):
+        words = [{"start": 3.0, "end": 4.1, "word": "almost"}]
+        audio, video = cut_pieces(VO_SHOTS, words)
+        ids = [s["id"] for s in call2.make_slots(audio, video)]
+        self.assertFalse([i for i in ids if i.endswith(("a", "b"))])
+
+    def test_borrowing_a_shot_that_the_voiceover_still_shows_is_refused_and_explained(self):
+        audio, video, described, line, vo = voiceover()
+        cut = call2.build_cut(audio, video, described, edit("cutaway", [(line, "V03"), vo]))
+        self.assertFalse([p for p in cut["pieces"] if "<-" in p["units"]])
+        self.assertTrue(any(f"V03 cannot cover {line}: it is already shown under {vo}b" in n
+                            for n in cut["stats"]["notes"]), cut["stats"]["notes"])
+
+    def test_re_covering_the_voiceover_slot_makes_the_cutaway_work(self):
+        audio, video, described, line, vo = voiceover()
+        cut = call2.build_cut(audio, video, described,
+                              edit("cutaway", [(line, "V03"), (vo + "a", "V02"), (vo + "b", "V01")]))
+        self.assertEqual(cut["stats"]["covers"], {line: "V03", vo + "b": "V01"})
+        self.assertFalse(any("cannot cover" in n or n.startswith("NO CUTAWAYS") for n in cut["stats"]["notes"]))
+        seen = sorted((p["video_start"], p["video_start"] + p["length"]) for p in cut["pieces"])
+        for a, b in zip(seen, seen[1:]):
+            self.assertGreaterEqual(b[0], a[1] - 1e-6)                # no footage twice
+        heard = sorted((p["audio_start"], p["audio_start"] + p["length"]) for p in cut["pieces"])
+        self.assertAlmostEqual(heard[-1][1], 11.0, places=2)          # the voiceover is heard to its end
+        self.assertAlmostEqual(heard[-2][1], heard[-1][0], places=2)  # ...without a break at the shot cut
+
+    def test_a_sound_is_never_split_and_a_whole_unit_can_be_named(self):
+        audio, video, described, line, vo = voiceover()
+        cut = call2.build_cut(audio, video, described, edit("cutaway", [(vo + "b", "V01")]))
+        self.assertEqual(cut["stats"]["units"], [vo + "a", vo + "b"])
+        self.assertTrue(any("one sound" in n for n in cut["stats"]["notes"]))
+        cut = call2.build_cut(audio, video, described, edit("synced", [vo]))
+        self.assertEqual(cut["stats"]["units"], [vo + "a", vo + "b"])
+        self.assertEqual(len(cut["pieces"]), 1)                       # synced: one continuous piece
 
 
 class ParseTest(unittest.TestCase):
@@ -131,7 +194,7 @@ class BuildCutTest(unittest.TestCase):
         own = [a.id for a in audio if a.over == ["V03"]]                        # the whole close-up
         cut = call2.build_cut(audio, video, described, edit("cutaway", [hope, (sweater, "V03"), *own]), TALK)
         self.assertFalse([p for p in cut["pieces"] if "<-" in p["units"]])
-        self.assertTrue(any("unused footage" in n for n in cut["stats"]["notes"]))
+        self.assertTrue(any("V03 cannot cover" in n and "already shown under" in n for n in cut["stats"]["notes"]))
 
     def test_a_cover_continues_and_never_repeats_footage(self):
         audio, video, described, hope, sweater = setup()

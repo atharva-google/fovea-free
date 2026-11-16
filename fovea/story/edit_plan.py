@@ -27,7 +27,7 @@ from .describe import REQUEST_TIMEOUT_S, GeminiError
 from .pieces import AudioUnit, VideoUnit
 from .select import Piece, merge_pieces
 
-CALL2_VERSION = 3
+CALL2_VERSION = 4
 CALL2_FILE = "call2.json"
 MIN_COVER = 0.8      # a cover picture shorter than this is not worth a cut
 MODES = ("synced", "cutaway")
@@ -74,38 +74,42 @@ SEGMENTS (what is heard, and over which shot)
 
 CUTAWAY_PROMPT = _COMMON + """
 This is the CUTAWAY edit: a sound may be heard over a DIFFERENT shot than the one it was recorded with.
-You get the sound and the picture as separate pieces:
-  AUDIO UNITS (A01, ...)  a few spoken words, or the sound between words; "over" is the shot it was recorded with
-  VIDEO UNITS (V01, ...)  one per shot
-Return, for each length, a list of segments in playing order. Each segment is one audio unit AND the video unit
-that is SEEN while it plays. Always give both. To show the picture a sound was recorded with, name the shot in
-its "over"; to cut away, name a different shot.
+You get the picture and the sound as separate pieces:
+  SHOTS (V01, ...)        the pictures
+  SOUND SLOTS (A01, ...)  a few spoken words, or the sound between words, with the shot it was recorded over
+                          ("own picture"). A sound that runs across several shots is split into one slot per
+                          shot (A22a, A22b, ...): keep ALL of its slots, in order, or none; each slot gets its
+                          own picture.
+Return, for each length, a list of segments in playing order. Each segment is one sound slot AND the shot that is
+SEEN while it plays. Always give both. Name the slot's own picture to leave it as it was; name a different shot to
+cut away.
 
-A cutaway edit MUST cut away. An answer in which every sound plays over its own shot is wrong: that is just the
-synced edit. At least two segments in every edit (more in a longer edit) must show a different shot than the one
-the sound was recorded over. Do not start from a synced edit; build it this way:
+A cutaway edit MUST cut away. An answer in which every slot keeps its own picture is wrong: that is just the
+synced edit. At least two segments in every edit (more in a longer edit) must show a different shot. Do not start
+from a synced edit; build it this way:
   1. Choose the SOUNDS that tell the story (the lines that must be heard).
   2. Choose the SHOTS that must be seen (the product, the reveal, the result, the closing card).
   3. Lay those shots over the chosen sounds. Good sounds to cover: voiceover and narration (nobody is seen saying
      it), a line by someone we have already seen, music or silence. Only shots marked "CAN COVER" may be used,
-     and only for sounds no longer than the seconds given there; any other choice is thrown away.
-  4. Usually drop the audio units recorded over a shot you used as a cover: that is where the time is saved.
+     and only for a slot no longer than the seconds given there; any other choice is thrown away.
 
-How to use cutaways:
-- This is how time is saved without losing anything: instead of playing a line and THEN showing a shot, show the
-  shot WHILE the line plays (name the gift while we see the gift). The covering shot then needs no time of its own.
-- Footage is never shown twice. If a shot covers a sound AND some of its own audio units are kept, the cover only
-  gets what is left of the shot, so prefer covering with shots whose own audio you are cutting.
-- A covering shot may cover several audio units; it keeps playing from where it left off.
-- The picture is shown for exactly as long as the sound lasts. Check the lengths against "CAN COVER up to".
-- A shot marked "cannot cover" shows someone talking; putting another sound over it looks wrong. Never use it.
+The one rule that makes or breaks a cutaway: EVERY SECOND OF A SHOT CAN BE SHOWN ONLY ONCE.
+- If you show V14 over an early line, then any slot you keep whose own picture is V14 can no longer show V14.
+  Give that slot a different picture (for example a shot from a part of the ad you cut), or do not keep it.
+  If you leave it on its own picture, your cutaway is thrown away.
+- This matters most for a closing voiceover that runs over several shots: if you borrow one of those shots
+  earlier, re-cover that voiceover slot with another shot.
+- A shot may cover several slots; it keeps playing from where it left off, up to its "CAN COVER" seconds in total.
+
+Also:
+- A shot marked "cannot cover" shows someone talking; another sound over it looks wrong. Never cut away to it.
 - A sound that belongs to what is seen, like (door slams), stays with its own picture.
-- Do not cover a line when seeing the person say it is the point (a reaction, a punchline delivered to camera).
+- Do not cover a line when seeing the person say it is the point (a punchline delivered to camera).
 
-VIDEO UNITS
+SHOTS
 {video}
 
-AUDIO UNITS
+SOUND SLOTS
 {audio}
 """
 
@@ -152,9 +156,35 @@ def cutaway_prompt(audio: List[AudioUnit], video: List[VideoUnit], described: Di
 
     vid = "\n".join(f"{v.id} | {v.dur:.2f}s | {can_cover(v)} | shows: {dv[v.id]['shows']} | "
                     f"focus: {dv[v.id]['focus']}{_needs(dv[v.id]['needs'], False)}" for v in video)
-    aud = "\n".join(f"{a.id} | {a.dur:.2f}s | over {' '.join(a.over)} | heard: {da[a.id]['heard']}"
-                    f"{_needs(da[a.id]['needs'], False)}" for a in audio)
-    return _fill(CUTAWAY_PROMPT, described, video, targets, video=vid, audio=aud)
+    lines = []
+    for s in make_slots(audio, video):
+        heard = da[s["audio"]]["heard"] if s["part"] == 0 else "(the same sound continues)"
+        needs = _needs(da[s["audio"]]["needs"], False) if s["part"] == 0 else ""
+        lines.append(f"{s['id']} | {s['end'] - s['start']:.2f}s | own picture {s['shot']} | heard: {heard}{needs}")
+    return _fill(CUTAWAY_PROMPT, described, video, targets, video=vid, audio="\n".join(lines))
+
+
+def make_slots(audio: List[AudioUnit], video: List[VideoUnit], min_part: float = 0.25) -> List[Dict[str, Any]]:
+    """Every audio unit, split at the shot cuts it runs across: one slot per shot, so each part of a long
+    sound can be given its own picture. Slivers shorter than ``min_part`` stay with their neighbour.
+    A unit over a single shot is one slot with the unit's own id; otherwise A22a, A22b, ..."""
+    out: List[Dict[str, Any]] = []
+    for a in audio:
+        parts = [[max(a.start, v.start), min(a.end, v.end), v.id] for v in video
+                 if min(a.end, v.end) - max(a.start, v.start) > 1e-6]
+        while len(parts) > 1:
+            k = min(range(len(parts)), key=lambda j: parts[j][1] - parts[j][0])
+            if parts[k][1] - parts[k][0] >= min_part:
+                break
+            j = k - 1 if k > 0 else k + 1
+            lo, hi = min(j, k), max(j, k)
+            parts[lo:hi + 1] = [[parts[lo][0], parts[hi][1], parts[j][2]]]
+        if not parts:
+            parts = [[a.start, a.end, a.over[0] if a.over else video[0].id]]
+        for i, (s, e, shot) in enumerate(parts):
+            out.append({"id": a.id if len(parts) == 1 else f"{a.id}{chr(97 + i)}", "audio": a.id,
+                        "start": s, "end": e, "shot": shot, "part": i})
+    return out
 
 
 def _fill(template: str, described: Dict[str, Any], all_shots: List[VideoUnit], targets: Sequence[float], **tables) -> str:
@@ -290,23 +320,36 @@ def build_cut(audio: List[AudioUnit], video: List[VideoUnit], described: Dict[st
     A, V = {a.id: a for a in audio}, {v.id: v for v in video}
     mode, target = edit["mode"], float(edit["target_s"])
     notes: List[str] = []
-    segs: List[List[str]] = []
-    seen = set()
+    slots = make_slots(audio, video)
+    S = {s["id"]: s for s in slots}
+    of_unit: Dict[str, List[str]] = {}
+    for s in slots:
+        of_unit.setdefault(s["audio"], []).append(s["id"])
+
+    asked: Dict[str, str] = {}                    # slot id -> picture Gemini asked for ("" = its own)
+    order: List[str] = []                         # audio units, in playing order
     for s in edit.get("segments") or []:
-        aid, vid = s.get("audio", ""), s.get("video", "") if mode == "cutaway" else ""
-        if aid not in A:
-            notes.append(f"unknown piece {aid or '(empty)'!r} ignored")
+        sid, vid = s.get("audio", ""), s.get("video", "") if mode == "cutaway" else ""
+        ids = [sid] if sid in S else of_unit.get(sid)
+        if not ids:
+            notes.append(f"unknown piece {sid or '(empty)'!r} ignored")
             continue
-        if aid in seen:
-            notes.append(f"{aid} listed twice: played once")
-            continue
-        seen.add(aid)
         if vid and vid not in V:
-            notes.append(f"{aid}: unknown picture {vid!r}, its own picture is used")
+            notes.append(f"{sid}: unknown picture {vid!r}, its own picture is used")
             vid = ""
-        if vid in A[aid].over:
-            vid = ""
-        segs.append([aid, vid])
+        for i in ids:
+            if i in asked:
+                notes.append(f"{i} listed twice: played once")
+                continue
+            asked[i] = "" if vid == S[i]["shot"] else vid
+            if S[i]["audio"] not in order:
+                order.append(S[i]["audio"])
+    segs: List[List[str]] = []                    # [slot id, cover shot or ""]; a sound is never split
+    for unit in order:
+        missing = [i for i in of_unit[unit] if i not in asked]
+        if missing:
+            notes.append(f"{unit} is one sound: its other part(s) {' '.join(missing)} are kept too")
+        segs.extend([i, asked.get(i, "")] for i in of_unit[unit])
 
     quiet = {v.id: quiet_spans(v, talk) for v in video}
     dv = {u["id"]: u for u in described["video_units"]}
@@ -315,14 +358,14 @@ def build_cut(audio: List[AudioUnit], video: List[VideoUnit], described: Dict[st
     def allocate() -> List[Optional[Tuple[float, float, float]]]:
         """Per segment with a cover: (picture start, cover length, seconds of its own picture first)."""
         cursor = {v.id: v.start for v in video}
-        own = [(A[aid].start, A[aid].end) for aid, vid in segs if not vid]      # footage shown with its own sound
+        own = [(S[i]["start"], S[i]["end"]) for i, vid in segs if not vid]      # footage shown with its own sound
         free = {v.id: _minus(quiet[v.id], own) for v in video}
         out: List[Optional[Tuple[float, float, float]]] = []
-        for aid, vid in segs:
+        for i, vid in segs:
             if not vid:
                 out.append(None)
                 continue
-            need, v = A[aid].dur, V[vid]
+            need, v = S[i]["end"] - S[i]["start"], V[vid]
             win = None
             for least in (need, min(need, MIN_COVER)):   # first a quiet stretch that fits the whole sound
                 for a, b in free[vid]:
@@ -345,30 +388,33 @@ def build_cut(audio: List[AudioUnit], video: List[VideoUnit], described: Dict[st
 
     while True:                                   # undo covers that cannot work, until nothing changes
         plan = allocate()
-        bad = next((i for i, (aid, vid) in enumerate(segs) if vid and plan[i] is None), None)
+        bad = next((k for k, (i, vid) in enumerate(segs) if vid and plan[k] is None), None)
         if bad is None:
             break
-        aid, vid = segs[bad]
-        notes.append(f"{vid} has no {min(A[aid].dur, MIN_COVER):.1f}s of unused footage without a talking face "
-                     f"to cover {aid}, which keeps its own picture")
+        i, vid = segs[bad]
+        shown_as_own = sorted({j for j, c in segs if not c and S[j]["shot"] == vid})
+        why = (f"it is already shown under {' '.join(shown_as_own)}" if shown_as_own
+               else "it has no stretch without a talking face left")
+        notes.append(f"{vid} cannot cover {i}: {why}. {i} keeps its own picture")
         segs[bad][1] = ""
 
     if mode == "cutaway" and segs and not any(vid for _, vid in segs):
         notes.append("NO CUTAWAYS: every sound plays over its own picture, so this is a synced edit")
     pieces: List[Piece] = []
-    for (aid, vid), win in zip(segs, plan):
-        a = A[aid]
+    for (i, vid), win in zip(segs, plan):
+        s = S[i]
+        dur = s["end"] - s["start"]
         if not vid:
-            pieces.append(Piece(a.start, a.start, a.dur, aid, da[aid]["heard"][:60]))
+            pieces.append(Piece(s["start"], s["start"], dur, i, da[s["audio"]]["heard"][:60]))
             continue
         start, length, own = win
         if own > 1e-3:
-            pieces.append(Piece(a.start, a.start, own, aid, "its own picture first"))
-        pieces.append(Piece(start, a.start + own, length, f"{aid}<-{vid}", f"over: {dv[vid]['shows']}"[:80]))
+            pieces.append(Piece(s["start"], s["start"], own, i, "its own picture first"))
+        pieces.append(Piece(start, s["start"] + own, length, f"{i}<-{vid}", f"over: {dv[vid]['shows']}"[:80]))
     pieces = merge_pieces(pieces, bridge_gap=1e-3)
 
-    kept = {aid for aid, _ in segs}
-    shown = {v for aid, vid in segs for v in ([vid] if vid else A[aid].over)}
+    kept = set(order)
+    shown = {vid or S[i]["shot"] for i, vid in segs}
     unmet = [f"{uid} needs {n}" for uid in [*sorted(kept), *sorted(shown)]
              for n in (da.get(uid) or dv.get(uid))["needs"] if n not in kept and n not in shown]
     if unmet:
@@ -384,8 +430,8 @@ def build_cut(audio: List[AudioUnit], video: List[VideoUnit], described: Dict[st
     elif abs(total - target) > max(1.0, 0.15 * target):
         notes.append(f"{abs(total - target):.1f}s {'over' if total > target else 'under'} the {target:g}s target")
     return {"pieces": [p.to_dict() for p in pieces],
-            "stats": {"target": target, "mode": mode, "total": total, "units": [aid for aid, _ in segs],
-                      "covers": {aid: vid for aid, vid in segs if vid}, "notes": notes, "ok": ok,
+            "stats": {"target": target, "mode": mode, "total": total, "units": [i for i, _ in segs],
+                      "covers": {i: vid for i, vid in segs if vid}, "notes": notes, "ok": ok,
                       "story": edit.get("story", "")}}
 
 
