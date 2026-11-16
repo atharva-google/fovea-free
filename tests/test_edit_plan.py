@@ -112,14 +112,23 @@ class BuildCutTest(unittest.TestCase):
         self.assertEqual(cut["stats"]["covers"], {sweater: "V03"})
         self.assertEqual(cut["stats"]["notes"], [])
 
-    def test_a_shot_used_as_a_cover_is_not_also_shown_on_its_own(self):
+    def test_a_shot_can_cover_and_be_shown_but_no_footage_is_seen_twice(self):
         audio, video, described, hope, sweater = setup()
-        own = next(a.id for a in audio if a.over == ["V03"])
-        cut = call2.build_cut(audio, video, described, edit("cutaway", [hope, (sweater, "V03"), own]), TALK)
-        self.assertFalse([p for p in cut["pieces"] if "<-" in p["units"]])       # the cover is undone
-        self.assertTrue(any("also shown on its own" in n for n in cut["stats"]["notes"]))
-        starts = [p["video_start"] for p in cut["pieces"]]
-        self.assertEqual(len(starts), len(set(starts)))
+        own = next(a for a in audio if a.over == ["V03"])                       # first 1.5 s of the close-up
+        cut = call2.build_cut(audio, video, described, edit("cutaway", [hope, (sweater, "V03"), own.id]), TALK)
+        over = [p for p in cut["pieces"] if "<-" in p["units"]]
+        self.assertEqual(len(over), 1)
+        self.assertGreaterEqual(over[0]["video_start"], own.end - 1e-6)         # the cover uses the rest of the shot
+        seen = sorted((p["video_start"], p["video_start"] + p["length"]) for p in cut["pieces"])
+        for a, b in zip(seen, seen[1:]):
+            self.assertGreaterEqual(b[0], a[1] - 1e-6)
+
+    def test_a_cover_is_undone_when_all_of_the_shot_is_shown_on_its_own(self):
+        audio, video, described, hope, sweater = setup()
+        own = [a.id for a in audio if a.over == ["V03"]]                        # the whole close-up
+        cut = call2.build_cut(audio, video, described, edit("cutaway", [hope, (sweater, "V03"), *own]), TALK)
+        self.assertFalse([p for p in cut["pieces"] if "<-" in p["units"]])
+        self.assertTrue(any("unused footage" in n for n in cut["stats"]["notes"]))
 
     def test_a_cover_continues_and_never_repeats_footage(self):
         audio, video, described, hope, sweater = setup()
@@ -146,6 +155,7 @@ class BuildCutTest(unittest.TestCase):
         cut = call2.build_cut(audio, video, no_needs(described), edit("cutaway", [(sweater, "V01")]), [(0.0, 4.0)])
         self.assertFalse([p for p in cut["pieces"] if "<-" in p["units"]])
         self.assertTrue(any("without a talking face" in n for n in cut["stats"]["notes"]))
+        self.assertTrue(any(n.startswith("NO CUTAWAYS") for n in cut["stats"]["notes"]))
 
     def test_bad_ids_and_repeats_are_dropped_and_reported(self):
         audio, video, described, hope, sweater = setup()
@@ -157,20 +167,13 @@ class BuildCutTest(unittest.TestCase):
         self.assertIn("listed twice", notes)
         self.assertIn("unknown picture 'V77'", notes)
 
-    def test_a_cut_piece_that_a_kept_piece_needs_is_put_back(self):
+    def test_an_unmet_need_and_a_missed_target_are_reported_not_changed(self):
         audio, video, described, hope, sweater = setup()
         cut = call2.build_cut(audio, video, described, edit("synced", [sweater], target=8.0), TALK)
         notes = " | ".join(cut["stats"]["notes"])
-        self.assertIn(f"{sweater} needs {hope}, which was cut: put back ({hope})", notes)
-        self.assertIn("under the 8s target", notes)                       # a missed length is reported, not fixed
-        self.assertEqual(cut["stats"]["units"], [hope, sweater])          # in story order
-
-    def test_an_ending_that_needs_a_cut_piece_brings_the_chain_back(self):
-        audio, video, described, hope, sweater = setup()
-        ending = [a.id for a in audio if a.over == ["V03"]]              # the sweater close-up needs her line...
-        cut = call2.build_cut(audio, video, described, edit("synced", ending[:1], target=3.0), TALK)
-        self.assertEqual(cut["stats"]["units"], [hope, sweater, ending[0]])   # ...and her line needs its setup
-        self.assertEqual(len([n for n in cut["stats"]["notes"] if "put back" in n]), 2)
+        self.assertIn(f"{sweater} needs {hope}", notes)
+        self.assertIn("under the 8s target", notes)
+        self.assertEqual(cut["stats"]["units"], [sweater])                # Gemini's edit is rendered as it asked
 
     def test_a_cutaway_edit_without_any_cutaway_says_so(self):
         audio, video, described, hope, sweater = setup()
