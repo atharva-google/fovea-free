@@ -5,6 +5,7 @@
     python -m fovea run input.mp4 -t 720x720            # exact pixel size
     python -m fovea run input.mp4 -t 9:16 --cut 15 10   # + 15 s and 10 s cutdowns (needs a Gemini key once per video)
     python -m fovea story input.mp4 -d 15 10            # story map + proposed cuts (prints, renders nothing)
+    python -m fovea describe input.mp4                  # two-call pipeline, call 1: describe every unit
     python -m fovea download [--all]                    # fetch model weights
     python -m fovea weights                             # show which weights are present
 """
@@ -117,6 +118,19 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="How far over the target optional material may go (the story itself may go further)")
     k.add_argument("--no-hook", action="store_true", help="Never move Gemini's hook to the front")
 
+    # ----------------------------------------------------------- describe
+    ds = sub.add_parser("describe", help="Call 1 of the two-call pipeline: Gemini watches the video once and "
+                                         "describes every shot and every piece of sound (prints, renders nothing)")
+    ds.add_argument("video", help="Path to the input video")
+    ds.add_argument("--gemini-key", default=None,
+                    help="Gemini API key (or set GEMINI_API_KEY). Not needed once a video has been described")
+    ds.add_argument("--gemini-model", default=d.gemini_model)
+    ds.add_argument("--refresh", action="store_true", help="Ask Gemini again even if an answer is stored")
+    ds.add_argument("--work-dir", type=Path, default=d.work_dir)
+    ds.add_argument("--weights-dir", type=Path, default=d.weights_dir)
+    ds.add_argument("--device", choices=["cuda", "mps", "cpu"], default=None)
+    ds.add_argument("--whisper-model", default=d.whisper_model)
+
     # ----------------------------------------------------------- download
     dl = sub.add_parser("download", help="Download model weights")
     dl.add_argument("--weights-dir", type=Path, default=d.weights_dir)
@@ -152,6 +166,10 @@ def main(argv=None) -> None:
         _story(args)
         return
 
+    if args.command == "describe":
+        _describe(args)
+        return
+
     from .pipeline import run
 
     cfg = PipelineConfig(
@@ -179,6 +197,58 @@ def main(argv=None) -> None:
     print("\nDone:")
     for o in outputs:
         print(f"  {o}")
+
+
+def _describe(args) -> None:
+    """``fovea describe``: call 1. Stored answer if this video has one, else analysis + one Gemini call."""
+    import os
+
+    from .story import describe as call1
+    from .story import store
+
+    video = Path(args.video)
+    if not video.is_file():
+        raise SystemExit(f"Input video not found: {video}")
+    cfg = PipelineConfig(weights_dir=args.weights_dir, work_dir=args.work_dir, device=args.device, transcribe=True,
+                         whisper_model=args.whisper_model, gemini_model=args.gemini_model, refresh_story=args.refresh)
+    fp = store.fingerprint(video)
+    job_root = cfg.work_dir / video.stem
+    found = None if cfg.refresh_story else call1.load(job_root / "prep", fp)
+    if found:
+        audio, units, record = found
+        print(f"Call 1 for {video.name} already stored in {job_root / 'prep'}: no analysis, no Gemini call\n")
+    else:
+        key = args.gemini_key or os.environ.get("GEMINI_API_KEY")
+        if not key:
+            raise SystemExit("This video has not been described yet, so a Gemini key is needed: "
+                             "pass --gemini-key or set GEMINI_API_KEY")
+        from . import steps
+        from .utils.device import get_device
+        from .utils.jobdir import JobDir
+
+        device = get_device(cfg.device)
+        job = JobDir(job_root)
+        job.set_source(video)
+        if job.video_info.exists() and job.read_json(job.video_info).get("sha256") not in (None, fp):
+            print("  this folder holds the analysis of a different file with the same name: re-running it")
+            cfg.force = True
+        if not job.job_json.exists():
+            job.write_json(job.job_json, {"config": {"targets": cfg.targets}})
+        print(f"Fovea describe | device={device} | job folder: {job.root}")
+        print("▶ analysis: prep, visual, audio (steps already done for this folder are skipped)", flush=True)
+        for i in range(steps.prep.run(job, cfg)):
+            steps.visual.run(job, cfg, device, i)
+        steps.audio.run(job, cfg, device)
+        print("▶ call 1", flush=True)
+        try:
+            out = steps.story.describe(job, cfg, key)
+        except Exception as e:  # noqa: BLE001 - show the reason, not a stack trace
+            raise SystemExit(f"Call 1 failed: {e}") from None
+        audio, units, record = out["audio"], out["video"], out["record"]
+        print()
+    if record.get("issues"):
+        print(f"Fixed while reading the answer: {'; '.join(record['issues'][:10])}\n")
+    print(call1.report(audio, units, record["described"]))
 
 
 def _story(args) -> None:

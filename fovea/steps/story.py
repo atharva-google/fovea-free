@@ -108,3 +108,65 @@ def load_analysis(job: JobDir, cfg: PipelineConfig) -> Tuple[List[Tuple[float, f
                 "ocr": sorted(ocr.get(shot_ids[shot_pos], []))}
 
     return shots, words, facts_at
+
+
+# =========================================================================== two-call pipeline: call 1
+def load_pieces_inputs(job: JobDir, cfg: PipelineConfig):
+    """``(shots, words, talk spans, on-screen text by shot position)`` from the finished analysis."""
+    from ..models.speakers import attach_speaking_scores
+    from ..story.pieces import spans_from_frames
+    from .render import merge_shards
+
+    transcript = job.audio_dir / "transcript.json"
+    if not job.shards.exists():
+        raise FileNotFoundError("The prep step has not run for this job")
+    if not transcript.exists():
+        raise FileNotFoundError("No transcript: the audio step (transcribe) must run first")
+    _, proxy, _ = job.video_infos()
+    sdf = pd.read_csv(job.shots).sort_values("start_sec")
+    shots = list(zip(sdf.start_sec.astype(float), sdf.end_sec.astype(float)))
+    position = {int(sid): i for i, sid in enumerate(sdf.shot_id.astype(int))}
+
+    words: List[Dict[str, Any]] = []
+    for seg in json.loads(transcript.read_text()):
+        for w in seg.get("words_data") or []:
+            if w.get("start") is not None and w.get("end") is not None:
+                words.append({"start": float(w["start"]), "end": float(w["end"]), "word": str(w["word"])})
+
+    data = merge_shards(job)
+    tracks = attach_speaking_scores(data["tracks"], data["speaker_scores"])
+    talking = {int(f) for frames in tracks.values() for f, dets in frames.items()
+               if any(d.get("cname") == "person" and d.get("speaking") for d in dets)}
+    ocr: Dict[int, List[str]] = {}
+    for r in data["ocr"]:
+        texts = ocr.setdefault(position.get(int(r["shot_id"]), -1), [])
+        if str(r["text"]) not in texts:
+            texts.append(str(r["text"]))
+    return shots, words, spans_from_frames(talking, proxy.fps), ocr
+
+
+def describe(job: JobDir, cfg: PipelineConfig, api_key: Optional[str] = None,
+             log: Callable[[str], None] = print) -> Dict[str, Any]:
+    """Call 1 for this video, or its stored answer. Returns ``{"audio", "video", "record", "cached"}``;
+    ``record["described"]`` is Gemini's description of every unit."""
+    from ..story import describe as call1
+    from ..story.pieces import cut_pieces
+
+    prep = job.units_json.parent
+    fp = store.fingerprint(job.source)
+    found = None if cfg.refresh_story else call1.load(prep, fp)
+    if found:
+        log(f"  call 1 already stored for this video ({prep / call1.CALL1_FILE}), no Gemini call")
+        return {"audio": found[0], "video": found[1], "record": found[2], "cached": True}
+    if not api_key:
+        raise StoryKeyRequired("Gemini key required: this video has not been described yet (call 1)")
+    shots, words, talk, ocr = load_pieces_inputs(job, cfg)
+    audio, video = cut_pieces(shots, words, talk, ocr)
+    if not video:
+        raise RuntimeError("Could not cut this video into units (no shots found)")
+    log(f"  {len(video)} video units (shots), {len(audio)} audio units "
+        f"({sum(a.kind == 'speech' for a in audio)} with speech) from {len(words)} words")
+    result = call1.request(job.source, audio, video, api_key, cfg.gemini_model, cfg.gemini_api_version, log)
+    call1.save(prep, fp, audio, video, result)
+    log(f"  stored: {prep / call1.PIECES_FILE} and {prep / call1.CALL1_FILE}")
+    return {"audio": audio, "video": video, "record": {"fingerprint": fp, **result}, "cached": False}
