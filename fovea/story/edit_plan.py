@@ -27,7 +27,7 @@ from .describe import REQUEST_TIMEOUT_S, GeminiError
 from .pieces import AudioUnit, VideoUnit
 from .select import Piece, merge_pieces
 
-CALL2_VERSION = 4
+CALL2_VERSION = 5
 CALL2_FILE = "call2.json"
 MIN_COVER = 0.8      # a cover picture shorter than this is not worth a cut
 MODES = ("synced", "cutaway")
@@ -55,8 +55,9 @@ How to edit:
   what you remove is only a short pause.
 - Keep the original order unless moving one strong moment to the very start clearly makes a better opening.
 - Before you answer, read each edit from start to finish using ONLY the pieces you kept. Nothing kept may react
-  to, refer to, or pay off something you cut. Check the ending hardest: if you cut a gag, also cut (or do not
-  choose) the pieces that call back to it, and end on something the kept story has earned.
+  to, refer to, or pay off something you cut. Check the ending hardest: if you cut a moment (a joke, a claim,
+  a demonstration), also cut (or do not choose) the pieces that call back to it, and end on something the kept
+  story has earned.
 - Refer to pieces ONLY by their id. Never write timestamps.
 """
 
@@ -78,8 +79,8 @@ You get the picture and the sound as separate pieces:
   SHOTS (V01, ...)        the pictures
   SOUND SLOTS (A01, ...)  a few spoken words, or the sound between words, with the shot it was recorded over
                           ("own picture"). A sound that runs across several shots is split into one slot per
-                          shot (A22a, A22b, ...): keep ALL of its slots, in order, or none; each slot gets its
-                          own picture.
+                          shot, named with a letter added to its id (for example A05a, A05b): keep ALL of
+                          its slots, in order, or none; each slot gets its own picture.
 Return, for each length, a list of segments in playing order. Each segment is one sound slot AND the shot that is
 SEEN while it plays. Always give both. Name the slot's own picture to leave it as it was; name a different shot to
 cut away.
@@ -94,11 +95,11 @@ from a synced edit; build it this way:
      and only for a slot no longer than the seconds given there; any other choice is thrown away.
 
 The one rule that makes or breaks a cutaway: EVERY SECOND OF A SHOT CAN BE SHOWN ONLY ONCE.
-- If you show V14 over an early line, then any slot you keep whose own picture is V14 can no longer show V14.
-  Give that slot a different picture (for example a shot from a part of the ad you cut), or do not keep it.
+- If you show a shot over one sound, then any slot you keep whose OWN picture is that same shot can no longer
+  show it. Give that slot a different picture (for example a shot from a part you cut), or do not keep it.
   If you leave it on its own picture, your cutaway is thrown away.
-- This matters most for a closing voiceover that runs over several shots: if you borrow one of those shots
-  earlier, re-cover that voiceover slot with another shot.
+- This comes up whenever one long sound (narration, a voiceover, music) runs over several shots: if you borrow
+  one of those shots elsewhere, give that slot of the long sound another picture.
 - A shot may cover several slots; it keeps playing from where it left off, up to its "CAN COVER" seconds in total.
 
 Also:
@@ -167,7 +168,7 @@ def cutaway_prompt(audio: List[AudioUnit], video: List[VideoUnit], described: Di
 def make_slots(audio: List[AudioUnit], video: List[VideoUnit], min_part: float = 0.25) -> List[Dict[str, Any]]:
     """Every audio unit, split at the shot cuts it runs across: one slot per shot, so each part of a long
     sound can be given its own picture. Slivers shorter than ``min_part`` stay with their neighbour.
-    A unit over a single shot is one slot with the unit's own id; otherwise A22a, A22b, ..."""
+    A unit over a single shot is one slot with the unit's own id; otherwise the id plus a letter (A05a, A05b)."""
     out: List[Dict[str, Any]] = []
     for a in audio:
         parts = [[max(a.start, v.start), min(a.end, v.end), v.id] for v in video

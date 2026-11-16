@@ -79,14 +79,14 @@ class SyncedEdits(BaseModel):
 
 
 class CutawaySegment(BaseModel):
-    audio: str = Field(description="The audio unit heard here, e.g. A04.")
+    audio: str = Field(description="The sound slot heard here, e.g. A04, or A05b for one part of a long sound.")
     video: str = Field(description="REQUIRED: the video unit (shot) SEEN while this sound plays, e.g. V03. Either a "
                                    "shot the sound was recorded over (its own picture), or a different shot (a cutaway).")
 
 
 class CutawayEdit(BaseModel):
     target_s: float = Field(description="The length that was asked for.")
-    segments: List[CutawaySegment] = Field(description="In playing order. Audio units not listed are cut.")
+    segments: List[CutawaySegment] = Field(description="In playing order. Sound slots not listed are cut.")
     story: str = Field(description="One or two sentences: how the story holds, and what was cut to get here.")
 
 
