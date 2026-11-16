@@ -1,8 +1,8 @@
 """Call 1: Gemini watches the video ONCE and describes every unit. Stored; never repeated for a file.
 
-For each video unit (a shot): what is seen, the one thing the viewer must see, whether the focal point
-OUR software chose (drawn on the uploaded video as a green line) is right and where it should be if
-not, and which earlier units the shot depends on (a reaction needs what it reacts to).
+For each video unit (a shot): what is seen, the one thing the viewer must see, and which earlier units
+the shot depends on (a reaction needs what it reacts to). Call 1 is about the story and the units
+only; checking the framing is a separate, optional call (``framing_check.py``).
 For each audio unit: what is really heard (the transcript corrected), and which earlier units it
 depends on (a punchline needs its setup).
 
@@ -22,7 +22,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .pieces import PIECES_VERSION, AudioUnit, VideoUnit
 
-CALL1_VERSION = 4           # bump when the prompt or schema changes in a way that makes stored answers stale
+CALL1_VERSION = 5           # bump when the prompt or schema changes in a way that makes stored answers stale
 REQUEST_TIMEOUT_S = 300
 PROCESSING_TIMEOUT_S = 180
 PIECES_FILE, CALL1_FILE = "pieces.json", "call1.json"
@@ -37,10 +37,6 @@ The video has already been cut into units with exact times (listed below):
                the sound was recorded over.
 Refer to units ONLY by their id. Never write timestamps.
 
-A thin GREEN VERTICAL LINE has been drawn on the video by us. It is NOT part of the ad: ignore it when you
-describe what is seen. It marks where our software would centre the picture when the ad is cropped to a
-narrower format (for example vertical). It can move within a shot, for example from one speaker to the other.
-
 The measurements next to each unit come from analysis software and can be wrong:
   visibly talking   share of the shot in which a face is seen talking
   detected text     on-screen text read by OCR (often garbled)
@@ -51,12 +47,6 @@ For EVERY video unit give:
   shows    what is seen, in one sentence: who, doing what, where; include readable on-screen text and any
            object that matters to the story (the product, the gift)
   focus    the ONE thing the viewer must see in this shot, in a few words
-  fixed_focus_x  judge the green line. Give -1 if it is on (or close to) what the viewer must see: this is the
-           usual case, and a line that follows the right people as they take turns speaking is also fine.
-           ONLY if the line is on the wrong thing for most of the shot (a person in the background, a logo, an
-           empty part of the frame, the wrong one of two people) give where the picture should be centred
-           instead for the whole shot: left to right, as a percentage of the frame width (0 = left edge,
-           50 = middle, 100 = right edge).
   needs    earlier units this shot makes no sense without (a reaction needs what it reacts to; a reveal needs
            its setup). Only the DIRECT ones, usually one or none; do not list the whole chain.
            Look hardest at the END of the video: a closing shot that calls back to an earlier moment (a joke, a
@@ -126,12 +116,8 @@ def clean(raw: Dict[str, Any], audio: List[AudioUnit], video: List[VideoUnit]) -
         if g is None:
             issues.append(f"{v.id} missing from the answer")
             g = {}
-        try:
-            x = int(round(float(g.get("fixed_focus_x", -1))))
-        except (TypeError, ValueError):
-            x = -1
         video_out.append({"id": v.id, "shows": str(g.get("shows") or ""), "focus": str(g.get("focus") or ""),
-                          "fixed_focus_x": x if 0 <= x <= 100 else -1, "needs": needs(v.id, g.get("needs"))})
+                          "needs": needs(v.id, g.get("needs"))})
     for a in audio:
         g = got_a.get(a.id)
         if g is None:
@@ -149,17 +135,17 @@ class GeminiError(RuntimeError):
     """A Gemini call failed. The message never contains the API key."""
 
 
-def request(video_path: str | Path, audio: List[AudioUnit], video: List[VideoUnit], api_key: str,
-            model: str = "gemini-3.8-flash", api_version: str = "v1beta",
-            log: Callable[[str], None] = print) -> Dict[str, Any]:
-    """Returns ``{"described", "issues", "model", "seconds"}``; ``described`` is the cleaned answer."""
+def ask_about_video(video_path: str | Path, text: str, schema: str, api_key: str, model: str, api_version: str,
+                    log: Callable[[str], None], what: str) -> Tuple[Dict[str, Any], float]:
+    """Upload a video, ask one question about it with an output schema (a class name in ``schemas.py``),
+    and return ``(the answer as a dict, seconds it took)``. The upload is deleted afterwards."""
     if not api_key:
-        raise GeminiError("A Gemini API key is required for call 1")
+        raise GeminiError(f"A Gemini API key is required for {what}")
     try:
         from google import genai
         from google.genai import types
 
-        from .schemas import Units
+        from . import schemas
     except ImportError as e:
         raise GeminiError(f"google-genai (and pydantic) must be installed: pip install -U google-genai ({e})") from e
 
@@ -184,24 +170,20 @@ def request(video_path: str | Path, audio: List[AudioUnit], video: List[VideoUni
             raise GeminiError(f"Gemini could not process the video (state: {getattr(uploaded.state, 'name', '?')})")
 
         part = types.Part(file_data=types.FileData(file_uri=uploaded.uri, mime_type=uploaded.mime_type))
-        log(f"  call 1: asking {model} to describe {len(video)} video and {len(audio)} audio units "
-            f"(gives up after {REQUEST_TIMEOUT_S}s)")
+        log(f"  {what}: asking {model} (gives up after {REQUEST_TIMEOUT_S}s)")
         t0 = time.time()
         resp = client.models.generate_content(
-            model=model, contents=[part, prompt(audio, video)],
-            config=types.GenerateContentConfig(response_mime_type="application/json", response_schema=Units))
+            model=model, contents=[part, text],
+            config=types.GenerateContentConfig(response_mime_type="application/json",
+                                               response_schema=getattr(schemas, schema)))
         seconds = round(time.time() - t0, 1)
         usage = getattr(resp, "usage_metadata", None)
         log(f"  answered in {seconds}s | tokens in={getattr(usage, 'prompt_token_count', None)} "
             f"out={getattr(usage, 'candidates_token_count', None)}")
         try:
-            raw = json.loads(resp.text or "")
+            return json.loads(resp.text or ""), seconds
         except ValueError:
             raise GeminiError("Gemini's answer was not valid JSON (it may have been cut off); run the command again")
-        described, issues = clean(raw, audio, video)
-        for issue in issues[:10]:
-            log(f"  call 1: {issue}")
-        return {"described": described, "issues": issues, "model": model, "seconds": seconds}
     except GeminiError:
         raise
     except Exception as e:  # noqa: BLE001 - SDK errors can echo request details; never leak the key
@@ -216,11 +198,16 @@ def request(video_path: str | Path, audio: List[AudioUnit], video: List[VideoUni
                 pass
 
 
-def focus_fixes(video: List[VideoUnit], described: Dict[str, Any]) -> List[Tuple[float, float, int]]:
-    """The shots in which Gemini says our focal point is wrong: ``[(start_s, end_s, x percent)]``."""
-    by_id = {u["id"]: u for u in described["video_units"]}
-    return [(v.start, v.end, by_id[v.id]["fixed_focus_x"]) for v in video
-            if v.id in by_id and by_id[v.id].get("fixed_focus_x", -1) >= 0]
+def request(video_path: str | Path, audio: List[AudioUnit], video: List[VideoUnit], api_key: str,
+            model: str = "gemini-3.8-flash", api_version: str = "v1beta",
+            log: Callable[[str], None] = print) -> Dict[str, Any]:
+    """Returns ``{"described", "issues", "model", "seconds"}``; ``described`` is the cleaned answer."""
+    log(f"  call 1: {len(video)} video and {len(audio)} audio units to describe")
+    raw, seconds = ask_about_video(video_path, prompt(audio, video), "Units", api_key, model, api_version, log, "call 1")
+    described, issues = clean(raw, audio, video)
+    for issue in issues[:10]:
+        log(f"  call 1: {issue}")
+    return {"described": described, "issues": issues, "model": model, "seconds": seconds}
 
 
 # =========================================================================== storage
@@ -272,9 +259,7 @@ def report(audio: List[AudioUnit], video: List[VideoUnit], described: Dict[str, 
         need = f"  needs {' '.join(d['needs'])}" if d["needs"] else ""
         lines.append(f"  {v.id}  {v.start:6.2f}-{v.end:6.2f}s {v.dur:5.2f}s  talking {v.talking:4.0%}{need}")
         lines.append(f"        shows: {d['shows']}")
-        fix = d["fixed_focus_x"]
-        lines.append(f"        focus: {d['focus']}  |  our line: "
-                     + ("fine" if fix < 0 else f"WRONG, centre at {fix}% from the left instead"))
+        lines.append(f"        focus: {d['focus']}")
     lines += ["", "AUDIO UNITS"]
     for a in audio:
         d = da[a.id]

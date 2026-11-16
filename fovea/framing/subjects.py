@@ -138,7 +138,7 @@ def fill_track_gaps(frames_data, shot_frames, max_gap=25):
     return out
 
 
-def watermark_indices(boxes, n_shots=None, tol=0.04, min_shots=3, min_share=0.25):
+def watermark_indices(boxes, n_shots=None, tol=0.04, min_shots=3, min_share=0.0):
     """Text that sits in the same place in many shots is a logo / watermark, not something to look at.
 
     ``boxes``: ``[(shot_id, cx, cy)]`` with the centre of each text box as a share of the frame (0-1).

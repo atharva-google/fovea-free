@@ -146,7 +146,7 @@ def load_pieces_inputs(job: JobDir, cfg: PipelineConfig):
 
 
 def describe(job: JobDir, cfg: PipelineConfig, api_key: Optional[str] = None,
-             log: Callable[[str], None] = print, video_path=None) -> Dict[str, Any]:
+             log: Callable[[str], None] = print) -> Dict[str, Any]:
     """Call 1 for this video, or its stored answer. Returns ``{"audio", "video", "record", "cached"}``;
     ``record["described"]`` is Gemini's description of every unit."""
     from ..story import describe as call1
@@ -166,11 +166,7 @@ def describe(job: JobDir, cfg: PipelineConfig, api_key: Optional[str] = None,
         raise RuntimeError("Could not cut this video into units (no shots found)")
     log(f"  {len(video)} video units (shots), {len(audio)} audio units "
         f"({sum(a.kind == 'speech' for a in audio)} with speech) from {len(words)} words")
-    if video_path is None:   # Gemini is shown our focal point as a green line (render.focus_preview)
-        from . import render
-
-        video_path = render.focus_preview(job, cfg, log)
-    result = call1.request(video_path, audio, video, api_key, cfg.gemini_model, cfg.gemini_api_version, log)
+    result = call1.request(job.source, audio, video, api_key, cfg.gemini_model, cfg.gemini_api_version, log)
     call1.save(prep, fp, audio, video, result)
     log(f"  stored: {prep / call1.PIECES_FILE} and {prep / call1.CALL1_FILE}")
     return {"audio": audio, "video": video, "record": {"fingerprint": fp, **result}, "cached": False}
@@ -231,3 +227,33 @@ def plan_edits(job: JobDir, cfg: PipelineConfig, described: Dict[str, Any], api_
             elif key in stored:
                 cuts[key + "_gemini"] = call2.build_cut(audio, video, desc, stored[key], talk)
     return cuts
+
+
+# =========================================================================== optional: framing check
+def framing_check(job: JobDir, cfg: PipelineConfig, api_key: Optional[str] = None,
+                  log: Callable[[str], None] = print) -> list:
+    """Gemini's corrections to our focal points, as ``[(start_s, end_s, x percent)]`` (``[]`` if none, or if
+    there is no stored answer for this framing and no key to ask with). Separate from call 1: it needs only
+    the shots and our focal points, no transcript, and stores its own file (prep/framing_check.json)."""
+    from ..story import framing_check as check
+    from ..story.pieces import build_video_units
+    from . import render
+
+    sdf = pd.read_csv(job.shots).sort_values("start_sec")
+    video = build_video_units(list(zip(sdf.start_sec.astype(float), sdf.end_sec.astype(float))))
+    centre, src, proxy = render.focus_line(job, cfg)
+    line = check.signature([centre[f] for f in sorted(centre)])
+    prep = job.units_json.parent
+    fp = store.fingerprint(job.source)
+    stored = None if cfg.refresh_story else check.load(prep, fp, line)
+    if stored is None:
+        if not api_key:
+            log("  framing check skipped: no stored answer for this framing and no Gemini key given")
+            return []
+        preview = render.focus_preview(job, centre, src, proxy, [(v.start, v.end, v.id) for v in video], log)
+        stored = check.request(preview, video, api_key, cfg.gemini_model, cfg.gemini_api_version, log)
+        check.save(prep, fp, line, stored)
+    else:
+        log(f"  framing check already stored for this framing ({prep / check.FRAMING_FILE}), no Gemini call")
+    log(check.report(video, stored["shots"]))
+    return check.focus_fixes(video, stored["shots"])

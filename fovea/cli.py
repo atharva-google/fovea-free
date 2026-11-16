@@ -86,9 +86,9 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="Units Gemini scores at or above this are always kept (default 8)")
     c.add_argument("--no-hook", action="store_true", help="Never move Gemini's hook to the front")
 
-    c.add_argument("--no-gemini-framing", action="store_true",
-                   help="Do not let Gemini correct the focal point (it does when a key is given or a video was "
-                        "already described)")
+    c.add_argument("--gemini-framing", action="store_true",
+                   help="Optional extra Gemini call: show it where the picture would be centred and let it correct "
+                        "shots where that is wrong (needs a key the first time; separate from the cutdown calls)")
 
     m = r.add_argument_group("misc")
     m.add_argument("--debug-renders", action="store_true", help="Write annotated tracking/motion videos")
@@ -194,7 +194,7 @@ def main(argv=None) -> None:
         cut_threshold_px=args.cut_threshold_px, still_deadband_px=args.still_deadband_px,
         debug_renders=args.debug_renders, force=args.force,
         cut_durations=args.cut_durations, cut_modes=args.cut_modes,
-        cut_brain=args.cut_brain, refresh_edits=args.refresh_edits, gemini_framing=not args.no_gemini_framing,
+        cut_brain=args.cut_brain, refresh_edits=args.refresh_edits, gemini_framing=args.gemini_framing,
         cut_params={k: v for k, v in (("cut_penalty", args.cut_penalty), ("arc_importance", args.arc_importance),
                                       ("use_hook", False if args.no_hook else None)) if v is not None},
     )

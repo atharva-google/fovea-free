@@ -41,12 +41,6 @@ class VideoUnit(BaseModel):
                                    "object that matters (the product, the gift).")
     focus: str = Field(description="The ONE thing the viewer must see in this unit, in a few words "
                                    "('her face', 'the sweater', 'the price tag').")
-    fixed_focus_x: int = Field(description="The green vertical line drawn on the video is where OUR software would "
-                                           "centre the picture. -1 = the line is on the right thing in this shot "
-                                           "(the usual case; it may move between people as they speak). Only if it "
-                                           "is on the WRONG thing for most of the shot: where the camera should be "
-                                           "centred instead for the whole shot, left to right, as a percentage of "
-                                           "the frame width (0 = left edge, 50 = middle, 100 = right edge).")
     needs: List[str] = Field(description="EARLIER units (video or audio ids) this shot makes no sense without: a "
                                          "reaction needs what it reacts to; a reveal needs its setup. Only the "
                                          "DIRECT ones, usually one or none. Empty if the shot stands alone.")
@@ -67,6 +61,23 @@ class Units(BaseModel):
     music: Music
     video_units: List[VideoUnit] = Field(description="Empty for an audio-only file.")
     audio_units: List[AudioUnit]
+
+
+# =========================================================================== optional: the framing check
+# Its own call, with its own stored answer (prep/framing_check.json). It does not touch call 1.
+class ShotFraming(BaseModel):
+    id: str = Field(description="Shot id, e.g. V07 (it is written in the top-left corner of the video). "
+                                "Every shot appears exactly once.")
+    fixed_focus_x: int = Field(description="-1 = the green line is on the right thing in this shot (the usual case). "
+                                           "Otherwise: where the picture should be centred for the whole shot, left "
+                                           "to right, as a percentage of the frame width (0 = left edge, 50 = "
+                                           "middle, 100 = right edge).")
+    why: str = Field(description="When you gave a position: what the line is on, and what it should be on. "
+                                 "Empty string when the line is fine.")
+
+
+class FramingCheck(BaseModel):
+    shots: List[ShotFraming]
 
 
 # =========================================================================== call 2: the edits

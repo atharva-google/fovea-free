@@ -131,9 +131,13 @@ class WatermarkTest(unittest.TestCase):
         self.assertEqual(watermark_indices([(0, 0.5, 0.5), (1, 0.5, 0.5), (2, 0.1, 0.9)], n_shots=10), set())
         self.assertEqual(watermark_indices([], n_shots=10), set())
 
-    def test_in_a_long_video_three_shots_are_not_enough(self):
+    def test_three_shots_are_enough_however_long_the_video(self):
         boxes = [(s, 0.1, 0.1) for s in range(3)]
-        self.assertEqual(watermark_indices(boxes, n_shots=40), set())   # needs a quarter of the shots
+        self.assertEqual(watermark_indices(boxes, n_shots=40), {0, 1, 2})
+        self.assertEqual(watermark_indices(boxes[:2], n_shots=40), set())
+
+    def test_the_same_text_twice_in_one_shot_is_not_three_shots(self):
+        self.assertEqual(watermark_indices([(7, 0.1, 0.1)] * 5, n_shots=10), set())
 
 
 class ShotMotionTest(unittest.TestCase):

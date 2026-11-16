@@ -8,8 +8,8 @@
 Reads:  input/<video>, prep/*, visual/*
 Writes: framing/*.csv, outputs/<label>.mp4, debug/*.mp4 (optional)
 
-With Gemini (``focus_preview`` before call 1, ``focus_fixes`` after it): Gemini is shown our focal
-point as a green line and may replace it, per shot, with a fixed position.
+Optional framing check (``steps.story.framing_check``): Gemini is shown our focal point as a green
+line (``focus_preview``) and may replace it, per shot, with a fixed position (``focus_fixes``).
 
 Cutdowns (``run_cuts``, after ``run``): the same crop along the same camera path, but only for the
 pieces of a cut, each with its own sound          -> outputs/<label>_<seconds>s_<mode>.mp4
@@ -68,18 +68,25 @@ def apply_focus_fixes(focal: pd.DataFrame, fixes, fps: float, src_w: int) -> pd.
     return focal
 
 
-def focus_preview(job: JobDir, cfg: PipelineConfig, log=print) -> Path:
-    """The video Gemini is shown in call 1: the analysis copy with sound and a GREEN LINE where our
-    software would centre the picture (the camera path for the first output format).
-
-    Writes prep/focus_preview.mp4."""
+def focus_line(job: JobDir, cfg: PipelineConfig):
+    """Where our software would centre the picture on every frame, for the first output format:
+    ``({frame: x in source pixels}, source info, proxy info)``."""
     focal, _, _, _, src, proxy = _focal(job, cfg)
     geom = CropGeometry.build(src.width, src.height, OutputTarget.parse(cfg.targets[0]), cfg.short_side)
     traj = plan_camera(focal, geom, cfg.pan_window_frames, cfg.cut_threshold_px, cfg.still_deadband_px)
-    centre = dict(zip(traj["frame_idx"].astype(int).tolist(), traj["smoothed_cx"].tolist()))
+    return dict(zip(traj["frame_idx"].astype(int).tolist(), traj["smoothed_cx"].tolist())), src, proxy
+
+
+def focus_preview(job: JobDir, centre: Dict[int, float], src: VideoInfo, proxy: VideoInfo, labels=(),
+                  log=print) -> Path:
+    """The video Gemini is shown for the framing check: the analysis copy with sound, a GREEN LINE where
+    our software would centre the picture, and the shot id in the top-left corner.
+
+    ``labels``: ``[(start_s, end_s, text)]``. Writes prep/focus_preview.mp4."""
     k = proxy.width / float(src.width)
     out = job.path("prep/focus_preview.mp4")
     w, h = proxy.width, proxy.height
+    spans = [(int(round(a * proxy.fps)), int(round(b * proxy.fps)), str(text)) for a, b, text in labels]
 
     with tempfile.TemporaryFile() as err:
         encoder = subprocess.Popen(
@@ -98,6 +105,10 @@ def focus_preview(job: JobDir, cfg: PipelineConfig, log=print) -> Path:
                 if i in centre:
                     last = int(centre[i] * k)
                 cv2.line(frame, (last, 0), (last, h - 1), (0, 255, 0), 4)
+                text = next((s for a, b, s in spans if a <= i < b), "")
+                if text:
+                    cv2.rectangle(frame, (0, 0), (110, 44), (0, 0, 0), -1)
+                    cv2.putText(frame, text, (10, 32), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
                 encoder.stdin.write(frame.tobytes())
                 i += 1
         except BrokenPipeError:
@@ -121,7 +132,7 @@ def run(job: JobDir, cfg: PipelineConfig, log=print, progress: Optional[Progress
         focus_fixes=None) -> Dict[str, str]:
     """Returns {format label: output path}, e.g. {"9x16": ".../outputs/9x16.mp4"}.
 
-    ``focus_fixes``: Gemini's corrections to our focal points (``story.describe.focus_fixes``), if any."""
+    ``focus_fixes``: Gemini's corrections to our focal points (``story.framing_check.focus_fixes``), if any."""
     progress = progress or noop
     n_stages = 1 + len(cfg.targets)
     progress("focal points", index=1, count=n_stages)
