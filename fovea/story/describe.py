@@ -21,7 +21,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .pieces import PIECES_VERSION, AudioUnit, VideoUnit
 
-CALL1_VERSION = 1           # bump when the prompt or schema changes in a way that makes stored answers stale
+CALL1_VERSION = 2           # bump when the prompt or schema changes in a way that makes stored answers stale
 REQUEST_TIMEOUT_S = 300
 PROCESSING_TIMEOUT_S = 180
 PIECES_FILE, CALL1_FILE = "pieces.json", "call1.json"
@@ -49,12 +49,15 @@ For EVERY video unit give:
   focus_x  where that thing is, left to right, as a percentage of the frame width (0 left edge, 100 right edge)
   needs    earlier units this shot makes no sense without (a reaction needs what it reacts to; a reveal needs
            its setup). Only the DIRECT ones, usually one or none; do not list the whole chain.
+           Look hardest at the END of the ad: a closing shot that calls back to an earlier gag, shows its result,
+           or repeats it, needs that gag. If the gag were cut, would this shot still make sense? If not, it needs it.
 
 For EVERY audio unit give:
   heard    what is REALLY heard. Write speech out exactly, in its own language and script, correcting the rough
            transcript. Put any other sound in round brackets: (aaa), (laughs), (door slams), (music), (silence).
   needs    earlier units this sound makes no sense without (a punchline needs its setup line; "look at this"
-           needs the shot it points at). Only the DIRECT ones, usually one or none.
+           needs the shot it points at; a line that refers back to an earlier gag needs that gag).
+           Only the DIRECT ones, usually one or none.
 
 Also give:
   summary  one or two sentences: the story of the ad

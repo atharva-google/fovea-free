@@ -21,6 +21,12 @@ def setup():
     return audio, video, described, ids["I hope it's shoes."], ids["A sweater."]
 
 
+def no_needs(described):
+    for u in [*described["video_units"], *described["audio_units"]]:
+        u["needs"] = []
+    return described
+
+
 def edit(mode, segments, target=5.0):
     return {"target_s": target, "mode": mode, "story": "s",
             "segments": [{"audio": s, "video": ""} if isinstance(s, str) else {"audio": s[0], "video": s[1]}
@@ -90,6 +96,7 @@ class BuildCutTest(unittest.TestCase):
         audio, video, described, hope, sweater = setup()
         i = next(k for k, a in enumerate(audio) if a.id == sweater)
         oh, aaa = audio[i - 2], audio[i - 1]
+        no_needs(described)
         with_it = call2.build_cut(audio, video, described, edit("synced", [oh.id, aaa.id, sweater]), TALK)
         without = call2.build_cut(audio, video, described, edit("synced", [oh.id, sweater]), TALK)
         self.assertEqual((len(with_it["pieces"]), len(without["pieces"])), (1, 2))
@@ -128,7 +135,7 @@ class BuildCutTest(unittest.TestCase):
     def test_a_cover_avoids_the_part_of_a_shot_where_a_face_is_talking(self):
         audio, video, described, hope, sweater = setup()
         # cover her punchline with shot V01, where she talks from 0.9 to 2.7 s: the picture must come from after that
-        cut = call2.build_cut(audio, video, described, edit("cutaway", [(sweater, "V01")]), TALK)
+        cut = call2.build_cut(audio, video, no_needs(described), edit("cutaway", [(sweater, "V01")]), TALK)
         over = [p for p in cut["pieces"] if "<-" in p["units"]]
         self.assertEqual(len(over), 1)
         self.assertGreaterEqual(over[0]["video_start"], 2.7)
@@ -136,7 +143,7 @@ class BuildCutTest(unittest.TestCase):
 
     def test_a_shot_with_no_quiet_footage_cannot_cover(self):
         audio, video, described, hope, sweater = setup()
-        cut = call2.build_cut(audio, video, described, edit("cutaway", [(sweater, "V01")]), [(0.0, 4.0)])
+        cut = call2.build_cut(audio, video, no_needs(described), edit("cutaway", [(sweater, "V01")]), [(0.0, 4.0)])
         self.assertFalse([p for p in cut["pieces"] if "<-" in p["units"]])
         self.assertTrue(any("without a talking face" in n for n in cut["stats"]["notes"]))
 
@@ -150,13 +157,27 @@ class BuildCutTest(unittest.TestCase):
         self.assertIn("listed twice", notes)
         self.assertIn("unknown picture 'V77'", notes)
 
-    def test_an_unmet_need_and_a_missed_target_are_reported_not_fixed(self):
+    def test_a_cut_piece_that_a_kept_piece_needs_is_put_back(self):
         audio, video, described, hope, sweater = setup()
         cut = call2.build_cut(audio, video, described, edit("synced", [sweater], target=8.0), TALK)
         notes = " | ".join(cut["stats"]["notes"])
-        self.assertIn(f"{sweater} needs {hope}, which was cut", notes)
-        self.assertIn("under the 8s target", notes)
-        self.assertEqual(cut["stats"]["units"], [sweater])
+        self.assertIn(f"{sweater} needs {hope}, which was cut: put back ({hope})", notes)
+        self.assertIn("under the 8s target", notes)                       # a missed length is reported, not fixed
+        self.assertEqual(cut["stats"]["units"], [hope, sweater])          # in story order
+
+    def test_an_ending_that_needs_a_cut_piece_brings_the_chain_back(self):
+        audio, video, described, hope, sweater = setup()
+        ending = [a.id for a in audio if a.over == ["V03"]]              # the sweater close-up needs her line...
+        cut = call2.build_cut(audio, video, described, edit("synced", ending[:1], target=3.0), TALK)
+        self.assertEqual(cut["stats"]["units"], [hope, sweater, ending[0]])   # ...and her line needs its setup
+        self.assertEqual(len([n for n in cut["stats"]["notes"] if "put back" in n]), 2)
+
+    def test_a_cutaway_edit_without_any_cutaway_says_so(self):
+        audio, video, described, hope, sweater = setup()
+        cut = call2.build_cut(audio, video, described, edit("cutaway", [(hope, "V01"), (sweater, "V02")]), TALK)
+        self.assertTrue(any(n.startswith("NO CUTAWAYS") for n in cut["stats"]["notes"]))
+        cut = call2.build_cut(audio, video, described, edit("cutaway", [hope, (sweater, "V03")]), TALK)
+        self.assertFalse(any(n.startswith("NO CUTAWAYS") for n in cut["stats"]["notes"]))
 
     def test_an_edit_that_keeps_everything_or_nothing_is_not_usable(self):
         audio, video, described, *_ = setup()

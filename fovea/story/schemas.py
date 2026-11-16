@@ -80,8 +80,8 @@ class SyncedEdits(BaseModel):
 
 class CutawaySegment(BaseModel):
     audio: str = Field(description="The audio unit heard here, e.g. A04.")
-    video: str = Field(description="The video unit (shot) SEEN while it plays, e.g. V03. Empty string = the picture "
-                                   "this sound was recorded with.")
+    video: str = Field(description="REQUIRED: the video unit (shot) SEEN while this sound plays, e.g. V03. Either a "
+                                   "shot the sound was recorded over (its own picture), or a different shot (a cutaway).")
 
 
 class CutawayEdit(BaseModel):
