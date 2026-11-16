@@ -89,8 +89,11 @@ def extract_frame_candidates(
             tag = f"person_{tid}"
         candidates.append({"cx": cx, "score": score, "tag": tag, "type": "person"})
 
-    # 2. Prominent OCR (high for the first ~0.5s of a shot, then decays once read)
-    if f_idx in ocr_by_frame:
+    # 2. Prominent OCR (high for the first ~0.5s of a shot, then decays once read).
+    #    Only when nobody is in the frame: a person always comes before on-screen text. (Text used to
+    #    outrank a non-speaking face at the start of every shot, and in a short shot the camera then
+    #    never left the text.)
+    if f_idx in ocr_by_frame and not candidates:
         read_decay = 1.0 if shot_rel_idx < 12 else max(0.15, 1.0 - (shot_rel_idx - 12) * 0.08)
         for box in ocr_by_frame[f_idx]:
             candidates.append({"cx": box["cx"], "score": 0.85 * read_decay, "tag": "ocr_text", "type": "ocr"})
