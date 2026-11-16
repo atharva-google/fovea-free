@@ -19,29 +19,47 @@ from .subjects import fill_track_gaps, person_score, shot_motion_cx, speaker_sco
 OcrByFrame = Dict[int, List[Dict[str, float]]]
 
 
-def parse_ocr_entries(ocr_df: pd.DataFrame, fps: float, video_w: int, n_shots: Optional[int] = None) -> OcrByFrame:
-    """Expand per-shot OCR rows into a {frame_idx: [boxes]} lookup. Text that sits in the same place in
-    many shots (a logo in a corner) is left out: it is never something to frame."""
+def _vertices(val):
+    if isinstance(val, (list, tuple)):
+        return val
+    if isinstance(val, str):
+        val_clean = val.strip()
+        try:
+            return ast.literal_eval(val_clean)
+        except (ValueError, SyntaxError):
+            matches = re.findall(r"\(\s*([0-9.]+)\s*,\s*([0-9.]+)\s*\)", val_clean)
+            if matches:
+                return [(float(x), float(y)) for x, y in matches]
+    return []
 
-    def safe_parse_vertices(val):
-        if isinstance(val, (list, tuple)):
-            return val
-        if isinstance(val, str):
-            val_clean = val.strip()
-            try:
-                return ast.literal_eval(val_clean)
-            except (ValueError, SyntaxError):
-                matches = re.findall(r"\(\s*([0-9.]+)\s*,\s*([0-9.]+)\s*\)", val_clean)
-                if matches:
-                    return [(float(x), float(y)) for x, y in matches]
-        return []
 
-    parsed = []       # (first frame, last frame, entry, (shot id, centre x 0-1, centre y 0-1))
+def split_logos(ocr_df: pd.DataFrame, n_shots: Optional[int] = None):
+    """Pre-check, before any crop centre is computed: text that sits in the same place in several shots
+    is a logo / watermark. Returns ``(text to frame, logos)``; only the first goes on to the framing."""
+    if len(ocr_df) == 0:
+        return ocr_df, ocr_df
+    where = []
     for k, (_, row) in enumerate(ocr_df.iterrows()):
+        v = _vertices(row["text_box_vertices"])
+        if not v or len(v) < 2:
+            where.append((f"unreadable-{k}", -1.0 - k, -1.0 - k))     # never matches another box
+            continue
+        xs, ys = [p[0] for p in v], [p[1] for p in v]
+        where.append((row["shot_id"], (min(xs) + max(xs)) / 2.0, (min(ys) + max(ys)) / 2.0))
+    logos = watermark_indices(where, n_shots)
+    is_logo = [k in logos for k in range(len(ocr_df))]
+    keep = [not x for x in is_logo]
+    return ocr_df[keep].reset_index(drop=True), ocr_df[is_logo].reset_index(drop=True)
+
+
+def parse_ocr_entries(ocr_df: pd.DataFrame, fps: float, video_w: int) -> OcrByFrame:
+    """Expand per-shot OCR rows into a {frame_idx: [boxes]} lookup."""
+    ocr_by_frame: OcrByFrame = {}
+    for _, row in ocr_df.iterrows():
         f_start = int(round(float(row["start_s"]) * fps))
         f_end = int(round(float(row["end_s"]) * fps))
 
-        vertices = safe_parse_vertices(row["text_box_vertices"])
+        vertices = _vertices(row["text_box_vertices"])
         if not vertices or len(vertices) < 2:
             continue
 
@@ -57,14 +75,6 @@ def parse_ocr_entries(ocr_df: pd.DataFrame, fps: float, video_w: int, n_shots: O
             "area": box_w * box_h,
             "confidence": float(row.get("confidence", 1.0)),
         }
-        shot = row["shot_id"] if "shot_id" in row else k
-        parsed.append((f_start, f_end, entry, (shot, entry["cx"] / float(video_w), (min(ys) + max(ys)) / 2.0)))
-
-    logos = watermark_indices([where for _, _, _, where in parsed], n_shots)
-    ocr_by_frame: OcrByFrame = {}
-    for k, (f_start, f_end, entry, _) in enumerate(parsed):
-        if k in logos:
-            continue
         for f in range(f_start, f_end + 1):
             ocr_by_frame.setdefault(f, []).append(entry)
     return ocr_by_frame
@@ -83,7 +93,8 @@ def extract_frame_candidates(
 ) -> List[Dict[str, Any]]:
     """What the camera could look at on this frame. One kind at a time, in this order:
 
-        people  >  a large object  >  on-screen text  >  movement  >  the middle of the frame
+        faces  >  a person with no visible face  >  a large object  >  on-screen text  >  movement
+        >  the middle of the frame
 
     so a lower kind is only ever followed when nothing of a higher kind is there.
     ``presence``: share of the shot each track id is on screen for (missing = the whole shot).
@@ -94,9 +105,10 @@ def extract_frame_candidates(
     presence = presence or {}
     dets = frames_data.get(f_idx, [])
 
-    # 1. People: ranked by size, how central they are and how long they are in the shot. Speaking is a
-    #    boost on top of that, scaled by the size of their face next to the largest face on screen.
+    # 1. Faces: ranked by the size of the face, how central and in focus it is, and how long it is in
+    #    the shot. Speaking is a boost on top, scaled by the face's size next to the largest face.
     persons = [d for d in dets if d.get("cname") == "person"]
+    sharpest = max((d.get("sharp") or 0.0 for d in persons), default=0.0)
 
     def face_area(d):
         b = d.get("face_bbox")
@@ -107,9 +119,13 @@ def extract_frame_candidates(
         tid = det["track_id"]
         box = det.get("face_bbox") or det["bbox"]
         cx = (box[0] + box[2]) / 2.0
-        area = (det["bbox"][2] - det["bbox"][0]) * (det["bbox"][3] - det["bbox"][1])
         offset = abs(cx / float(video_w) - 0.5) / 0.5
-        score = person_score(area / frame_area, offset, presence.get(tid, 1.0))
+        rel_sharp = det["sharp"] / sharpest if det.get("sharp") is not None and sharpest > 0 else 1.0
+        if det.get("face_bbox") is not None:
+            score = person_score(face_area(det) / frame_area, offset, presence.get(tid, 1.0), rel_sharp, full=0.10)
+        else:   # older analysis: a person stored without a face box
+            area = (det["bbox"][2] - det["bbox"][0]) * (det["bbox"][3] - det["bbox"][1])
+            score = person_score(area / frame_area, offset, presence.get(tid, 1.0))
         if det.get("speaking") is True:
             rel = face_area(det) / largest_face if largest_face > 0 else 1.0
             score = speaker_score(score, rel, det.get("asd_score") or 0.0)
@@ -120,10 +136,21 @@ def extract_frame_candidates(
     if candidates:
         return candidates
 
-    # 2. A large object that is there for a real part of the shot (a product). The detector's label is
+    # 2. A person with no visible face (seen from behind, far away): only when no face is there.
+    for det in dets:
+        if det.get("cname") != "body":
+            continue
+        x1, y1, x2, y2 = det["bbox"]
+        offset = abs((x1 + x2) / 2.0 / float(video_w) - 0.5) / 0.5
+        score = 0.9 * person_score((x2 - x1) * (y2 - y1) / frame_area, offset, presence.get(det["track_id"], 1.0))
+        candidates.append({"cx": (x1 + x2) / 2.0, "score": score, "tag": f"body_{det['track_id']}", "type": "person"})
+    if candidates:
+        return candidates
+
+    # 3. A large object that is there for a real part of the shot (a product). The detector's label is
     #    ignored: it calls a chocolate bar a "cell phone", but the box is right.
     for det in dets:
-        if det.get("cname") == "person":
+        if det.get("cname") in ("person", "body"):
             continue
         x1, y1, x2, y2 = det["bbox"]
         ratio = (x2 - x1) * (y2 - y1) / frame_area
@@ -133,14 +160,14 @@ def extract_frame_candidates(
     if candidates:
         return candidates
 
-    # 3. On-screen text (logos that sit in the same place in every shot were removed earlier).
+    # 4. On-screen text (logos that sit in the same place in several shots were removed before framing).
     #    High for the first ~0.5s of a shot, then it decays once read.
     if f_idx in ocr_by_frame:
         read_decay = 1.0 if shot_rel_idx < 12 else max(0.15, 1.0 - (shot_rel_idx - 12) * 0.08)
         return [{"cx": box["cx"], "score": 0.85 * read_decay, "tag": "ocr_text", "type": "ocr"}
                 for box in ocr_by_frame[f_idx]]
 
-    # 4. Movement: strong movement on this frame, else where the whole shot moves.
+    # 5. Movement: strong movement on this frame, else where the whole shot moves.
     motion = motion_results.get(f_idx, {})
     density = motion.get("instant_density", 0.0)
     weight = motion.get("motion_weight", 0.0)
@@ -150,7 +177,7 @@ def extract_frame_candidates(
     if shot_motion is not None and 0.05 * video_w <= shot_motion <= 0.95 * video_w:
         return [{"cx": shot_motion, "score": 0.30, "tag": "shot_motion", "type": "motion"}]
 
-    # 5. Nothing to go on: the middle of the frame.
+    # 6. Nothing to go on: the middle of the frame.
     return [{"cx": video_w / 2.0, "score": 0.20, "tag": "frame_center", "type": "fallback"}]
 
 
@@ -233,7 +260,7 @@ def find_focal_points_viterbi(
     max_jump_cost: float = 4.0,
     switch_penalty: float = 1.2,
 ) -> pd.DataFrame:
-    ocr_by_frame = parse_ocr_entries(ocr_df, fps, video_width, n_shots=len(shots_df))
+    ocr_by_frame = parse_ocr_entries(ocr_df, fps, video_width)
     records = []
     for _, shot in shots_df.iterrows():
         s_id = int(shot["shot_id"])

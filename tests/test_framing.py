@@ -80,6 +80,20 @@ class WhatTheCameraFollowsTest(unittest.TestCase):
         c = extract_frame_candidates(0, 0, {0: [silent, talker]}, {}, {}, W, H)
         self.assertEqual(max(c, key=lambda x: x["score"])["tag"], "speaker_2")
 
+    def test_a_person_with_no_face_is_followed_only_when_no_face_is_there(self):
+        back = {"cname": "body", "track_id": 1000, "bbox": [800, 100, 1100, 700], "conf": 0.8}
+        cup = {"cname": "cup", "track_id": 2000, "bbox": [100, 100, 700, 600], "conf": 0.9}
+        c = extract_frame_candidates(0, 0, {0: [back, cup]}, TEXT, {}, W, H)
+        self.assertEqual([x["tag"] for x in c], ["body_1000"])             # before the object and the text
+        c = extract_frame_candidates(0, 0, {0: [back, person(x=200)]}, TEXT, {}, W, H)
+        self.assertEqual([x["tag"] for x in c], ["person_1"])              # a face is there: the body is not used
+
+    def test_the_in_focus_face_wins_over_a_blurred_one_of_the_same_size(self):
+        blurred = {**person(x=300, size=200), "track_id": 1, "sharp": 20.0}
+        clear = {**person(x=800, size=200), "track_id": 2, "sharp": 400.0}
+        c = extract_frame_candidates(0, 0, {0: [blurred, clear]}, {}, {}, W, H)
+        self.assertEqual(max(c, key=lambda x: x["score"])["tag"], "person_2")
+
     def test_with_nothing_at_all_the_camera_stays_in_the_middle(self):
         c = extract_frame_candidates(5, 0, {}, TEXT, {}, W, H)           # frame 5: no people, no text
         self.assertEqual([(x["type"], x["cx"]) for x in c], [("fallback", W / 2)])

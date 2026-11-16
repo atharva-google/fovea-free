@@ -26,7 +26,8 @@ import numpy as np
 import pandas as pd
 
 from ..config import PipelineConfig
-from ..framing import CropGeometry, OutputTarget, find_focal_points_rules, find_focal_points_viterbi, plan_camera
+from ..framing import (CropGeometry, OutputTarget, find_focal_points_rules, find_focal_points_viterbi, plan_camera,
+                       split_logos)
 from ..models.ocr import records_to_df
 from ..models.speakers import attach_speaking_scores
 from ..story.edit import decode_args, encode_args, frame_plan
@@ -45,6 +46,12 @@ def run(job: JobDir, cfg: PipelineConfig, log=print, progress: Optional[Progress
     data = merge_shards(job)
     tracks = attach_speaking_scores(data["tracks"], data["speaker_scores"])
     ocr = records_to_df(data["ocr"])
+    # Pre-check before any crop centre is computed: a logo that sits in the same place in several shots is
+    # set aside (framing/logos.csv) and never reaches the framing.
+    ocr, logos = split_logos(ocr, len(shots))
+    logos.to_csv(job.framing_dir / "logos.csv", index=False)
+    if len(logos):
+        log(f"  {len(logos)} logo / watermark text box(es) set aside (framing/logos.csv)")
 
     # Focal points are found in proxy pixels, then scaled to source pixels
     common = dict(shots_df=shots, shot_tracks=tracks, ocr_df=ocr, motion_results=data["motion"],

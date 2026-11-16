@@ -138,7 +138,7 @@ def fill_track_gaps(frames_data, shot_frames, max_gap=25):
     return out
 
 
-def watermark_indices(boxes, n_shots=None, tol=0.04, min_shots=3, min_share=0.25):
+def watermark_indices(boxes, n_shots=None, tol=0.04, min_shots=3, min_share=0.0):
     """Text that sits in the same place in many shots is a logo / watermark, not something to look at.
 
     ``boxes``: ``[(shot_id, cx, cy)]`` with the centre of each text box as a share of the frame (0-1).
@@ -172,12 +172,15 @@ def shot_motion_cx(motion_results, shot_frames, min_density=0.05, min_share=0.2)
     return total / weight
 
 
-def person_score(area_ratio, center_offset, presence=1.0):
-    """How strongly a person who is NOT speaking attracts the camera (0.5 - 0.9; a speaker scores 2+).
+def person_score(area_ratio, center_offset, presence=1.0, rel_sharp=1.0, full=0.25):
+    """How strongly a person who is NOT speaking attracts the camera (up to 0.9; speaking multiplies it).
 
-    ``area_ratio``: their box as a share of the frame; ``center_offset``: 0 in the middle of the
-    frame, 1 at an edge; ``presence``: share of the shot they are on screen for. Large, central
-    people who are there for the whole shot come first; someone passing at the edge comes last."""
-    size = min(1.0, max(0.0, area_ratio) / 0.25)
+    ``area_ratio``: their FACE box as a share of the frame (``full`` = the share at which bigger
+    stops mattering); ``center_offset``: 0 in the middle of the frame, 1 at an edge; ``presence``:
+    share of the shot they are on screen for; ``rel_sharp``: how in-focus their face is next to the
+    sharpest face on screen (1 = the sharpest). A large, central, in-focus face that is there for
+    the whole shot comes first; a small, blurred face at the edge comes last."""
+    size = min(1.0, max(0.0, area_ratio) / full)
     central = 1.0 - min(1.0, max(0.0, center_offset))
-    return 0.50 + 0.22 * size + 0.10 * central + 0.08 * min(1.0, max(0.0, presence))
+    base = 0.40 + 0.30 * size + 0.12 * central + 0.08 * min(1.0, max(0.0, presence))
+    return base * (0.55 + 0.45 * min(1.0, max(0.0, rel_sharp)))

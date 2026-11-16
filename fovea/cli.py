@@ -18,7 +18,7 @@ from pathlib import Path
 from .config import PipelineConfig
 from .framing.geometry import PRESETS
 
-CORE_WEIGHTS = ["yolo", "blazeface", "talknet", "easyocr"]
+CORE_WEIGHTS = ["yolo", "blazeface", "blazeface_short", "talknet", "easyocr"]
 ALL_WEIGHTS = CORE_WEIGHTS + ["yolo_pose", "whisper", "demucs"]
 
 

@@ -48,7 +48,7 @@ def plan_shot(raw, tags, min_cx, max_cx, crop_w, pan_window=12, cut_threshold=45
         # ...but a person who is there for a real part of the shot comes before text, motion or the
         # frame centre, even if those were followed for more frames (a person seen late in the shot)
         enough = max(5, int(0.2 * n))
-        people = {t: c for t, c in counts.items() if c >= enough and str(t).startswith(("speaker", "person"))}
+        people = {t: c for t, c in counts.items() if c >= enough and str(t).startswith(("speaker", "person", "body"))}
         pool = people or counts
         top = max(pool, key=lambda t: (str(t).startswith("speaker"), pool[t], -list(tags).index(t)))
         pos = _median([x for x, t in zip(tgt, tags) if t == top])

@@ -74,8 +74,20 @@ class ProminenceTest(unittest.TestCase):
         self.assertGreater(person_score(0.2, 0.5, 0.5), base)
         self.assertGreater(person_score(0.1, 0.1, 0.5), base)
         self.assertGreater(person_score(0.1, 0.5, 1.0), base)
-        self.assertLessEqual(person_score(5.0, -1.0, 9.0), 0.9)      # never near a speaker's 2.0
-        self.assertGreaterEqual(person_score(0.0, 1.0, 0.0), 0.5)    # never below text / motion fallbacks
+        self.assertLessEqual(person_score(5.0, -1.0, 9.0), 0.9)
+        self.assertGreater(person_score(0.0, 1.0, 0.0, rel_sharp=0.0), 0.2)   # still positive
+
+    def test_a_blurred_face_ranks_well_below_the_same_face_in_focus(self):
+        sharp = person_score(0.05, 0.3, 1.0, rel_sharp=1.0, full=0.10)
+        blurred = person_score(0.05, 0.3, 1.0, rel_sharp=0.2, full=0.10)
+        self.assertLess(blurred, 0.7 * sharp)
+
+    def test_the_large_central_face_beats_a_face_in_the_crowd_behind(self):
+        # the frame from a real ad (1280x720): hero face 238x237 near the middle, a man behind 123x122 on the right
+        frame = 1280 * 720.0
+        hero = person_score(238 * 237 * 1.69 / frame, 0.2, 1.0, full=0.10)       # 1.69: the stored margin
+        crowd = person_score(123 * 122 * 1.69 / frame, 0.42, 1.0, full=0.10)
+        self.assertGreater(hero, crowd + 0.2)
 
 
 class SpeakerBoostTest(unittest.TestCase):
@@ -131,9 +143,13 @@ class WatermarkTest(unittest.TestCase):
         self.assertEqual(watermark_indices([(0, 0.5, 0.5), (1, 0.5, 0.5), (2, 0.1, 0.9)], n_shots=10), set())
         self.assertEqual(watermark_indices([], n_shots=10), set())
 
-    def test_in_a_long_video_three_shots_are_not_enough(self):
+    def test_three_shots_are_enough_however_long_the_video(self):
         boxes = [(s, 0.1, 0.1) for s in range(3)]
-        self.assertEqual(watermark_indices(boxes, n_shots=40), set())   # needs a quarter of the shots
+        self.assertEqual(watermark_indices(boxes, n_shots=40), {0, 1, 2})
+        self.assertEqual(watermark_indices(boxes[:2], n_shots=40), set())
+
+    def test_the_same_text_twice_in_one_shot_is_not_three_shots(self):
+        self.assertEqual(watermark_indices([(7, 0.1, 0.1)] * 5, n_shots=10), set())
 
 
 class ShotMotionTest(unittest.TestCase):

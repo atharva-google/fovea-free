@@ -24,6 +24,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
+BLAZEFACE_SHORT_URL = (
+    "https://storage.googleapis.com/mediapipe-models/face_detector/"
+    "blaze_face_short_range/float16/latest/blaze_face_short_range.tflite"
+)
 BLAZEFACE_URL = (
     "https://storage.googleapis.com/mediapipe-models/face_detector/"
     "blaze_face_full_range/float16/latest/blaze_face_full_range.tflite"
@@ -50,6 +54,7 @@ def _specs(yolo_weights: str = "yolo26s.pt", whisper_model: str = "medium",
         "yolo": WeightSpec("yolo", yolo_weights, "Ultralytics YOLO person detector", "tracking", "AGPL-3.0"),
         "yolo_pose": WeightSpec("yolo_pose", pose_weights, "Ultralytics YOLO-pose (face_backend=pose)", "tracking", "AGPL-3.0"),
         "blazeface": WeightSpec("blazeface", "blaze_face_full_range.tflite", "MediaPipe face detector", "tracking", "Apache-2.0"),
+        "blazeface_short": WeightSpec("blazeface_short", "blaze_face_short_range.tflite", "MediaPipe face detector for close-ups", "tracking", "Apache-2.0"),
         "talknet": WeightSpec("talknet", "pretrain_TalkSet.model", "TalkNet active-speaker model", "speaker", "MIT"),
         "easyocr": WeightSpec("easyocr", "easyocr", "EasyOCR detector + recognizer", "ocr", "Apache-2.0"),
         "whisper": WeightSpec("whisper", f"whisper-{whisper_model}", "faster-whisper (CTranslate2)", "transcribe", "MIT"),
@@ -107,6 +112,10 @@ def _dl_blazeface(spec: WeightSpec, weights_dir: Path, **_) -> None:
     _http_download(BLAZEFACE_URL, weights_dir / spec.path)
 
 
+def _dl_blazeface_short(spec: WeightSpec, weights_dir: Path, **_) -> None:
+    _http_download(BLAZEFACE_SHORT_URL, weights_dir / spec.path)
+
+
 def _dl_talknet(spec: WeightSpec, weights_dir: Path, **_) -> None:
     import gdown
 
@@ -139,6 +148,7 @@ _DOWNLOADERS: Dict[str, Callable] = {
     "yolo": _dl_yolo,
     "yolo_pose": _dl_yolo,
     "blazeface": _dl_blazeface,
+    "blazeface_short": _dl_blazeface_short,
     "talknet": _dl_talknet,
     "easyocr": _dl_easyocr,
     "whisper": _dl_whisper,
@@ -183,7 +193,7 @@ def ensure_weight(
 
 
 def download_all(weights_dir: Path, keys: Optional[List[str]] = None, **kwargs) -> None:
-    keys = keys or ["yolo", "blazeface", "talknet", "easyocr"]
+    keys = keys or ["yolo", "blazeface", "blazeface_short", "talknet", "easyocr"]
     for key in keys:
         _log(f"ensuring {key} ...")
         path = ensure_weight(key, weights_dir, **kwargs)

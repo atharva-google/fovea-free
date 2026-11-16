@@ -88,7 +88,7 @@ def analyze_shard(proxy_path: str, audio_path: str, shots_df: pd.DataFrame, prox
         n_detect = sum(-(-(int(s["end_frame"]) - int(s["start_frame"])) // every) for s in shots)
         tracks = _track(proxy_path, shots, fps, cfg, device, workers, timings,
                         counter("tracking", n_detect, "frames").add)
-        log(f"    {sum(1 for t in tracks.values() for d in t.values() if d)} frames with people")
+        log(f"    {sum(1 for t in tracks.values() for d in t.values() if any(x.get('face_bbox') is not None for x in d))} frames with a face")
 
     # ---- 2. active speaker detection
     speaker_scores: List[Dict[str, Any]] = []
@@ -134,10 +134,11 @@ SPEAKERS = "speakers (TalkNet)"
 def _summary(shots, tracks: ShotTracks, speaker_scores, ocr_records, motion_res, cfg: PipelineConfig) -> Dict[str, Any]:
     face_tracks = {(sid, d["track_id"]) for sid, frames in tracks.items() for dets in frames.values()
                    for d in dets if d.get("face_bbox") is not None}
+    has_face = lambda dets: any(d.get("face_bbox") is not None for d in dets)  # noqa: E731
     speaking = sum(1 for t in speaker_scores for v in t["scores"] if float(v) > 0)
     return {
         "shots": len(shots),
-        "frames_with_people": sum(1 for frames in tracks.values() for dets in frames.values() if dets),
+        "frames_with_people": sum(1 for frames in tracks.values() for dets in frames.values() if has_face(dets)),
         "face_tracks": len(face_tracks),
         "talknet": ({"face_tracks_scored": len(speaker_scores), "speaking_frames": speaking}
                     if cfg.enable_speaker_detection else "disabled"),
@@ -170,11 +171,14 @@ def _track(proxy_path: str, shots: List[Dict[str, Any]], fps: float, cfg: Pipeli
     with timings("tracker_load"):
         if cfg.face_backend == "pose":
             tracker = PersonTracker(str(ensure_for(cfg, "yolo_pose")), device, fps, "pose",
-                                    conf=cfg.yolo_conf, iou=cfg.yolo_iou, detect_every=cfg.detect_every)
+                                    conf=cfg.yolo_conf, iou=cfg.yolo_iou, detect_every=cfg.detect_every,
+                                    face_margin=cfg.face_margin)
         else:
             tracker = PersonTracker(str(ensure_for(cfg, "yolo")), device, fps, "mediapipe",
                                     face_model_path=str(ensure_for(cfg, "blazeface")), conf=cfg.yolo_conf,
-                                    iou=cfg.yolo_iou, face_min_conf=cfg.face_min_conf, detect_every=cfg.detect_every)
+                                    iou=cfg.yolo_iou, face_min_conf=cfg.face_min_conf, detect_every=cfg.detect_every,
+                                    face_short_model_path=str(ensure_for(cfg, "blazeface_short")),
+                                    face_margin=cfg.face_margin)
     try:
         raw = tracker.track_shots(proxy_path, shots, batch_size=cfg.detect_batch, decoders=workers,
                                   face_workers=workers, on_frames=on_frames)
