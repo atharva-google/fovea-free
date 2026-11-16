@@ -26,10 +26,10 @@ def answer(audio, video):
     return {
         "summary": "She hopes for shoes and gets a sweater.", "music": "bed",
         "video_units": [
-            {"id": "V01", "shows": "a woman walks in with a gift", "focus": "her face", "focus_x": 40, "needs": []},
-            {"id": "V02", "shows": "her face falls as she opens it", "focus": "her face", "focus_x": 50, "needs": ["V01"]},
+            {"id": "V01", "shows": "a woman walks in with a gift", "focus": "her face", "fixed_focus_x": -1, "needs": []},
+            {"id": "V02", "shows": "her face falls as she opens it", "focus": "her face", "fixed_focus_x": -1, "needs": ["V01"]},
             {"id": "V03", "shows": "a red sweater in the box; tag reads 'For you'", "focus": "the sweater",
-             "focus_x": 55, "needs": [line.id]},
+             "fixed_focus_x": 55, "needs": [line.id]},
         ],
         "audio_units": [{"id": a.id, "heard": {line.id: "A sweater.", pause.id: "(aaa)"}.get(a.id, a.text or "(silence)"),
                          "needs": [setup.id] if a.id == line.id else []} for a in audio],
@@ -70,13 +70,13 @@ class Call1Test(unittest.TestCase):
         audio, video = pieces()
         raw = answer(audio, video)
         raw["video_units"] = raw["video_units"][:1] + [{"id": "V99", "shows": "?"}]
-        raw["video_units"][0]["focus_x"] = 250
+        raw["video_units"][0]["fixed_focus_x"] = 250
         raw["audio_units"] = [u for u in raw["audio_units"] if u["heard"] != "A sweater."]
         raw["music"] = "loud"
         described, issues = call1.clean(raw, audio, video)
         self.assertEqual([u["id"] for u in described["video_units"]], ["V01", "V02", "V03"])
-        self.assertEqual(described["video_units"][0]["focus_x"], 100)
-        self.assertEqual(described["video_units"][2], {"id": "V03", "shows": "", "focus": "", "focus_x": 50, "needs": []})
+        self.assertEqual(described["video_units"][0]["fixed_focus_x"], -1)        # out of range: our line stays
+        self.assertEqual(described["video_units"][2], {"id": "V03", "shows": "", "focus": "", "fixed_focus_x": -1, "needs": []})
         line = next(a for a in audio if a.text == "A sweater.")
         got = next(u for u in described["audio_units"] if u["id"] == line.id)
         self.assertEqual(got["heard"], "A sweater.")                           # falls back to the rough transcript
@@ -97,12 +97,28 @@ class Call1Test(unittest.TestCase):
             (prep / "call1.json").write_text("{broken")
             self.assertIsNone(call1.load(prep, "abc"))
 
+    def test_only_the_shots_gemini_corrected_become_focus_fixes(self):
+        audio, video = pieces()
+        described, _ = call1.clean(answer(audio, video), audio, video)
+        self.assertEqual(call1.focus_fixes(video, described), [(8.0, 11.0, 55)])     # the sweater shot only
+        for u in described["video_units"]:
+            u["fixed_focus_x"] = -1
+        self.assertEqual(call1.focus_fixes(video, described), [])
+
+    def test_the_prompt_explains_the_green_line(self):
+        audio, video = pieces()
+        text = call1.prompt(audio, video)
+        self.assertIn("GREEN VERTICAL LINE", text)
+        self.assertIn("fixed_focus_x", text)
+        self.assertNotIn("focus_x  where that thing is", text)
+
     def test_the_report_shows_what_gemini_saw_heard_and_linked(self):
         audio, video = pieces()
         described, _ = call1.clean(answer(audio, video), audio, video)
         text = call1.report(audio, video, described)
         self.assertIn("shows: her face falls as she opens it", text)
-        self.assertIn("focus: the sweater (at 55% from the left)", text)
+        self.assertIn("focus: the sweater  |  our line: WRONG, centre at 55% from the left instead", text)
+        self.assertIn("focus: her face  |  our line: fine", text)
         self.assertIn("heard: (aaa)", text)
         self.assertIn("needs V01", text)
         json.dumps(described)

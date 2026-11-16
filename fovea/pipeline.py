@@ -56,24 +56,26 @@ def run(video_path: str | Path, config: Optional[PipelineConfig] = None, gemini_
     job.write_json(job.job_json, {"config": {"targets": cfg.targets}})
     print(f"Fovea | device={device} | job folder: {job.root}")
 
-    key = gemini_api_key or os.environ.get("GEMINI_API_KEY")
-    need_story = False
-    if cfg.cut_durations:
-        fp, stored_units, _ = steps.story.lookup(job, cfg)
-        need_story = stored_units is None
-        if cfg.cut_brain == "gemini":
-            from .story import describe as call1
+    from .story import describe as call1
 
-            need_story = cfg.refresh_story or call1.load(job.units_json.parent, fp) is None
-        # The folder is named after the file name: never cut a video using another file's analysis.
-        if job.video_info.exists() and job.read_json(job.video_info).get("sha256") not in (None, fp):
-            print("  this folder holds the analysis of a different file with the same name: re-running it")
-            cfg.force = True
-        if need_story and not key:   # fail now, not after minutes of analysis
-            raise steps.story.StoryKeyRequired(
-                "Cutdowns need a Gemini key the first time a video is seen: pass --gemini-key or set GEMINI_API_KEY")
-        if need_story:
-            cfg.transcribe = True    # the units are built from the transcript
+    key = gemini_api_key or os.environ.get("GEMINI_API_KEY")
+    fp, stored_units, _ = steps.story.lookup(job, cfg)
+    # The folder is named after the file name: never use another file's analysis.
+    if job.video_info.exists() and job.read_json(job.video_info).get("sha256") not in (None, fp):
+        print("  this folder holds the analysis of a different file with the same name: re-running it")
+        cfg.force = True
+    has_call1 = not cfg.refresh_story and not cfg.force and call1.load(job.units_json.parent, fp) is not None
+    gemini_cuts = bool(cfg.cut_durations) and cfg.cut_brain == "gemini"
+    # Call 1 (Gemini watches the video once) is used for the cutdowns AND to check our framing. It runs when
+    # a key is given; without a key its stored answer is used if there is one, else the standard framing.
+    want_call1 = gemini_cuts or (cfg.gemini_framing and bool(key or has_call1))
+    need_story = (want_call1 and not has_call1) or (bool(cfg.cut_durations) and cfg.cut_brain == "code"
+                                                     and stored_units is None)
+    if need_story and not key:   # fail now, not after minutes of analysis
+        raise steps.story.StoryKeyRequired(
+            "Cutdowns need a Gemini key the first time a video is seen: pass --gemini-key or set GEMINI_API_KEY")
+    if need_story:
+        cfg.transcribe = True    # the units are built from the transcript
 
     with _step("1/4 prep"):
         n_shards = steps.prep.run(job, cfg)
@@ -88,8 +90,23 @@ def run(video_path: str | Path, config: Optional[PipelineConfig] = None, gemini_
         with _step(f"2/4 visual (shard {i + 1}/{n_shards})"):
             steps.visual.run(job, cfg, device, i)
 
+    fixes = []
+    if want_call1:
+        with _step("call 1 (Gemini describes the video and checks our framing)"):
+            try:
+                if audio_future is not None and not has_call1:
+                    print("  waiting for the transcript", flush=True)
+                    audio_future.result()
+                described = steps.story.describe(job, cfg, key)
+                if cfg.gemini_framing:
+                    fixes = call1.focus_fixes(described["video"], described["record"]["described"])
+                    print(f"  Gemini: our focal point is wrong in {len(fixes)} of {len(described['video'])} shots",
+                          flush=True)
+            except Exception as e:  # noqa: BLE001 - the standard framing still works without Gemini
+                print(f"  ✗ call 1 failed ({type(e).__name__}: {e}); the standard framing is used", flush=True)
+
     with _step("4/4 render"):
-        rendered = steps.render.run(job, cfg)
+        rendered = steps.render.run(job, cfg, focus_fixes=fixes)
 
     if cfg.cut_durations:
         with _step("cutdowns"):

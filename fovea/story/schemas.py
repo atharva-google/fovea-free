@@ -41,8 +41,12 @@ class VideoUnit(BaseModel):
                                    "object that matters (the product, the gift).")
     focus: str = Field(description="The ONE thing the viewer must see in this unit, in a few words "
                                    "('her face', 'the sweater', 'the price tag').")
-    focus_x: int = Field(description="Where that thing is, left to right, as a percentage of the frame width: "
-                                     "0 = left edge, 50 = middle, 100 = right edge.")
+    fixed_focus_x: int = Field(description="The green vertical line drawn on the video is where OUR software would "
+                                           "centre the picture. -1 = the line is on the right thing in this shot "
+                                           "(the usual case; it may move between people as they speak). Only if it "
+                                           "is on the WRONG thing for most of the shot: where the camera should be "
+                                           "centred instead for the whole shot, left to right, as a percentage of "
+                                           "the frame width (0 = left edge, 50 = middle, 100 = right edge).")
     needs: List[str] = Field(description="EARLIER units (video or audio ids) this shot makes no sense without: a "
                                          "reaction needs what it reacts to; a reveal needs its setup. Only the "
                                          "DIRECT ones, usually one or none. Empty if the shot stands alone.")

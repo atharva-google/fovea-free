@@ -146,7 +146,7 @@ def load_pieces_inputs(job: JobDir, cfg: PipelineConfig):
 
 
 def describe(job: JobDir, cfg: PipelineConfig, api_key: Optional[str] = None,
-             log: Callable[[str], None] = print) -> Dict[str, Any]:
+             log: Callable[[str], None] = print, video_path=None) -> Dict[str, Any]:
     """Call 1 for this video, or its stored answer. Returns ``{"audio", "video", "record", "cached"}``;
     ``record["described"]`` is Gemini's description of every unit."""
     from ..story import describe as call1
@@ -166,7 +166,11 @@ def describe(job: JobDir, cfg: PipelineConfig, api_key: Optional[str] = None,
         raise RuntimeError("Could not cut this video into units (no shots found)")
     log(f"  {len(video)} video units (shots), {len(audio)} audio units "
         f"({sum(a.kind == 'speech' for a in audio)} with speech) from {len(words)} words")
-    result = call1.request(job.source, audio, video, api_key, cfg.gemini_model, cfg.gemini_api_version, log)
+    if video_path is None:   # Gemini is shown our focal point as a green line (render.focus_preview)
+        from . import render
+
+        video_path = render.focus_preview(job, cfg, log)
+    result = call1.request(video_path, audio, video, api_key, cfg.gemini_model, cfg.gemini_api_version, log)
     call1.save(prep, fp, audio, video, result)
     log(f"  stored: {prep / call1.PIECES_FILE} and {prep / call1.CALL1_FILE}")
     return {"audio": audio, "video": video, "record": {"fingerprint": fp, **result}, "cached": False}

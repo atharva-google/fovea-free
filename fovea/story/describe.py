@@ -1,7 +1,8 @@
 """Call 1: Gemini watches the video ONCE and describes every unit. Stored; never repeated for a file.
 
-For each video unit (a shot): what is seen, the one thing the viewer must see and where it is, and
-which earlier units the shot depends on (a reaction needs what it reacts to).
+For each video unit (a shot): what is seen, the one thing the viewer must see, whether the focal point
+OUR software chose (drawn on the uploaded video as a green line) is right and where it should be if
+not, and which earlier units the shot depends on (a reaction needs what it reacts to).
 For each audio unit: what is really heard (the transcript corrected), and which earlier units it
 depends on (a punchline needs its setup).
 
@@ -21,7 +22,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .pieces import PIECES_VERSION, AudioUnit, VideoUnit
 
-CALL1_VERSION = 3           # bump when the prompt or schema changes in a way that makes stored answers stale
+CALL1_VERSION = 4           # bump when the prompt or schema changes in a way that makes stored answers stale
 REQUEST_TIMEOUT_S = 300
 PROCESSING_TIMEOUT_S = 180
 PIECES_FILE, CALL1_FILE = "pieces.json", "call1.json"
@@ -36,6 +37,10 @@ The video has already been cut into units with exact times (listed below):
                the sound was recorded over.
 Refer to units ONLY by their id. Never write timestamps.
 
+A thin GREEN VERTICAL LINE has been drawn on the video by us. It is NOT part of the ad: ignore it when you
+describe what is seen. It marks where our software would centre the picture when the ad is cropped to a
+narrower format (for example vertical). It can move within a shot, for example from one speaker to the other.
+
 The measurements next to each unit come from analysis software and can be wrong:
   visibly talking   share of the shot in which a face is seen talking
   detected text     on-screen text read by OCR (often garbled)
@@ -46,7 +51,12 @@ For EVERY video unit give:
   shows    what is seen, in one sentence: who, doing what, where; include readable on-screen text and any
            object that matters to the story (the product, the gift)
   focus    the ONE thing the viewer must see in this shot, in a few words
-  focus_x  where that thing is, left to right, as a percentage of the frame width (0 left edge, 100 right edge)
+  fixed_focus_x  judge the green line. Give -1 if it is on (or close to) what the viewer must see: this is the
+           usual case, and a line that follows the right people as they take turns speaking is also fine.
+           ONLY if the line is on the wrong thing for most of the shot (a person in the background, a logo, an
+           empty part of the frame, the wrong one of two people) give where the picture should be centred
+           instead for the whole shot: left to right, as a percentage of the frame width (0 = left edge,
+           50 = middle, 100 = right edge).
   needs    earlier units this shot makes no sense without (a reaction needs what it reacts to; a reveal needs
            its setup). Only the DIRECT ones, usually one or none; do not list the whole chain.
            Look hardest at the END of the video: a closing shot that calls back to an earlier moment (a joke, a
@@ -117,11 +127,11 @@ def clean(raw: Dict[str, Any], audio: List[AudioUnit], video: List[VideoUnit]) -
             issues.append(f"{v.id} missing from the answer")
             g = {}
         try:
-            x = max(0, min(100, int(round(float(g.get("focus_x", 50))))))
+            x = int(round(float(g.get("fixed_focus_x", -1))))
         except (TypeError, ValueError):
-            x = 50
+            x = -1
         video_out.append({"id": v.id, "shows": str(g.get("shows") or ""), "focus": str(g.get("focus") or ""),
-                          "focus_x": x, "needs": needs(v.id, g.get("needs"))})
+                          "fixed_focus_x": x if 0 <= x <= 100 else -1, "needs": needs(v.id, g.get("needs"))})
     for a in audio:
         g = got_a.get(a.id)
         if g is None:
@@ -206,6 +216,13 @@ def request(video_path: str | Path, audio: List[AudioUnit], video: List[VideoUni
                 pass
 
 
+def focus_fixes(video: List[VideoUnit], described: Dict[str, Any]) -> List[Tuple[float, float, int]]:
+    """The shots in which Gemini says our focal point is wrong: ``[(start_s, end_s, x percent)]``."""
+    by_id = {u["id"]: u for u in described["video_units"]}
+    return [(v.start, v.end, by_id[v.id]["fixed_focus_x"]) for v in video
+            if v.id in by_id and by_id[v.id].get("fixed_focus_x", -1) >= 0]
+
+
 # =========================================================================== storage
 def save(folder: str | Path, fp: str, audio: List[AudioUnit], video: List[VideoUnit], result: Dict[str, Any]) -> None:
     folder = Path(folder)
@@ -255,7 +272,9 @@ def report(audio: List[AudioUnit], video: List[VideoUnit], described: Dict[str, 
         need = f"  needs {' '.join(d['needs'])}" if d["needs"] else ""
         lines.append(f"  {v.id}  {v.start:6.2f}-{v.end:6.2f}s {v.dur:5.2f}s  talking {v.talking:4.0%}{need}")
         lines.append(f"        shows: {d['shows']}")
-        lines.append(f"        focus: {d['focus']} (at {d['focus_x']}% from the left)")
+        fix = d["fixed_focus_x"]
+        lines.append(f"        focus: {d['focus']}  |  our line: "
+                     + ("fine" if fix < 0 else f"WRONG, centre at {fix}% from the left instead"))
     lines += ["", "AUDIO UNITS"]
     for a in audio:
         d = da[a.id]

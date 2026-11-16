@@ -8,6 +8,9 @@
 Reads:  input/<video>, prep/*, visual/*
 Writes: framing/*.csv, outputs/<label>.mp4, debug/*.mp4 (optional)
 
+With Gemini (``focus_preview`` before call 1, ``focus_fixes`` after it): Gemini is shown our focal
+point as a green line and may replace it, per shot, with a fixed position.
+
 Cutdowns (``run_cuts``, after ``run``): the same crop along the same camera path, but only for the
 pieces of a cut, each with its own sound          -> outputs/<label>_<seconds>s_<mode>.mp4
 """
@@ -35,11 +38,8 @@ from ..utils.progress import Counter, Progress, noop
 from ..utils.video import FFmpegFrameReader, VideoInfo, h264_encoder_args, hwaccel_args
 
 
-def run(job: JobDir, cfg: PipelineConfig, log=print, progress: Optional[Progress] = None) -> Dict[str, str]:
-    """Returns {format label: output path}, e.g. {"9x16": ".../outputs/9x16.mp4"}."""
-    progress = progress or noop
-    n_stages = 1 + len(cfg.targets)
-    progress("focal points", index=1, count=n_stages)
+def _focal(job: JobDir, cfg: PipelineConfig):
+    """Our own focal point per frame (in SOURCE pixels), from the detections alone."""
     src, proxy, _ = job.video_infos()
     shots = pd.read_csv(job.shots)
     data = merge_shards(job)
@@ -54,6 +54,82 @@ def run(job: JobDir, cfg: PipelineConfig, log=print, progress: Optional[Progress
     else:
         focal = find_focal_points_viterbi(**common, video_height=proxy.height)
     focal["target_cx"] = focal["target_cx"] * (src.width / proxy.width)
+    return focal, tracks, shots, data, src, proxy
+
+
+def apply_focus_fixes(focal: pd.DataFrame, fixes, fps: float, src_w: int) -> pd.DataFrame:
+    """Gemini's corrections on top of our focal points: in each ``(start_s, end_s, x percent)`` the
+    focal point is fixed at that position for the whole stretch (tag ``gemini_fixed``)."""
+    for start, end, x in fixes or []:
+        rows = (focal["frame_idx"] >= int(round(start * fps))) & (focal["frame_idx"] < int(round(end * fps)))
+        focal.loc[rows, "target_cx"] = x / 100.0 * src_w
+        focal.loc[rows, "tag"] = "gemini_fixed"
+        focal.loc[rows, "type"] = "gemini"
+    return focal
+
+
+def focus_preview(job: JobDir, cfg: PipelineConfig, log=print) -> Path:
+    """The video Gemini is shown in call 1: the analysis copy with sound and a GREEN LINE where our
+    software would centre the picture (the camera path for the first output format).
+
+    Writes prep/focus_preview.mp4."""
+    focal, _, _, _, src, proxy = _focal(job, cfg)
+    geom = CropGeometry.build(src.width, src.height, OutputTarget.parse(cfg.targets[0]), cfg.short_side)
+    traj = plan_camera(focal, geom, cfg.pan_window_frames, cfg.cut_threshold_px, cfg.still_deadband_px)
+    centre = dict(zip(traj["frame_idx"].astype(int).tolist(), traj["smoothed_cx"].tolist()))
+    k = proxy.width / float(src.width)
+    out = job.path("prep/focus_preview.mp4")
+    w, h = proxy.width, proxy.height
+
+    with tempfile.TemporaryFile() as err:
+        encoder = subprocess.Popen(
+            ["ffmpeg", "-y", "-v", "error", "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{w}x{h}",
+             "-r", f"{proxy.fps}", "-i", "-", "-i", str(job.source), "-map", "0:v:0", "-map", "1:a:0?",
+             "-c:v", "libx264", "-preset", "veryfast", "-crf", "26", "-pix_fmt", "yuv420p",
+             "-c:a", "aac", "-b:a", "96k", "-shortest", "-movflags", "+faststart", str(out)],
+            stdin=subprocess.PIPE, stderr=err)
+        cap = cv2.VideoCapture(str(job.proxy))
+        try:
+            i, last = 0, int(src.width / 2 * k)
+            while True:
+                ok, frame = cap.read()
+                if not ok or frame is None:
+                    break
+                if i in centre:
+                    last = int(centre[i] * k)
+                cv2.line(frame, (last, 0), (last, h - 1), (0, 255, 0), 4)
+                encoder.stdin.write(frame.tobytes())
+                i += 1
+        except BrokenPipeError:
+            pass
+        finally:
+            cap.release()
+            if encoder.stdin and not encoder.stdin.closed:
+                try:
+                    encoder.stdin.close()
+                except BrokenPipeError:
+                    pass
+            rc = encoder.wait()
+        if rc != 0:
+            err.seek(0)
+            raise RuntimeError(f"Could not write the focus preview:\n{err.read().decode(errors='ignore')[-1500:]}")
+    log(f"  focus preview for Gemini: {out}")
+    return out
+
+
+def run(job: JobDir, cfg: PipelineConfig, log=print, progress: Optional[Progress] = None,
+        focus_fixes=None) -> Dict[str, str]:
+    """Returns {format label: output path}, e.g. {"9x16": ".../outputs/9x16.mp4"}.
+
+    ``focus_fixes``: Gemini's corrections to our focal points (``story.describe.focus_fixes``), if any."""
+    progress = progress or noop
+    n_stages = 1 + len(cfg.targets)
+    progress("focal points", index=1, count=n_stages)
+    focal, tracks, shots, data, src, proxy = _focal(job, cfg)
+    if focus_fixes:
+        focal = apply_focus_fixes(focal, focus_fixes, proxy.fps, src.width)
+        log(f"  Gemini corrected the focal point in {len(focus_fixes)} shot(s): "
+            + ", ".join(f"{a:.1f}-{b:.1f}s -> {x}%" for a, b, x in focus_fixes))
     focal.to_csv(job.framing_dir / "focal_points.csv", index=False)
 
     outputs: Dict[str, str] = {}

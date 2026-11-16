@@ -144,6 +144,7 @@ class PipelineConfig:
     # Cutdowns to render next to the full-length outputs: every duration x mode x target becomes a video.
     cut_durations: List[float] = field(default_factory=list)  # seconds, e.g. [15, 10]; empty = no cutdowns
     cut_modes: List[str] = field(default_factory=lambda: ["synced", "cutaway"])
+    gemini_framing: bool = True  # when call 1 runs (or is stored): let Gemini correct our focal point per shot
     cut_brain: str = "gemini"    # who builds the edit: "gemini" (two calls: describe, then edit) | "code" (story map + selector)
     refresh_edits: bool = False  # gemini brain: ask call 2 again even if an edit is stored for this length and mode
     cut_params: Dict[str, Any] = field(default_factory=dict)  # selector settings (fovea/story/select.py), e.g. {"cut_penalty": 1}
