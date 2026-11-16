@@ -170,3 +170,57 @@ def describe(job: JobDir, cfg: PipelineConfig, api_key: Optional[str] = None,
     call1.save(prep, fp, audio, video, result)
     log(f"  stored: {prep / call1.PIECES_FILE} and {prep / call1.CALL1_FILE}")
     return {"audio": audio, "video": video, "record": {"fingerprint": fp, **result}, "cached": False}
+
+
+# =========================================================================== two-call pipeline: call 2
+def load_talk(job: JobDir) -> list:
+    """Time spans in which a face is visibly talking, from the visual step."""
+    from ..models.speakers import attach_speaking_scores
+    from ..story.pieces import spans_from_frames
+    from .render import merge_shards
+
+    _, proxy, _ = job.video_infos()
+    data = merge_shards(job)
+    tracks = attach_speaking_scores(data["tracks"], data["speaker_scores"])
+    talking = {int(f) for frames in tracks.values() for f, dets in frames.items()
+               if any(d.get("cname") == "person" and d.get("speaking") for d in dets)}
+    return spans_from_frames(talking, proxy.fps)
+
+
+def plan_edits(job: JobDir, cfg: PipelineConfig, described: Dict[str, Any], api_key: Optional[str] = None,
+               log: Callable[[str], None] = print) -> Dict[str, Dict[str, Any]]:
+    """Call 2 for every requested length and mode (stored edits are reused), turned into exact pieces.
+
+    ``described`` is what ``describe`` returned. Returns cuts in the shape ``render.run_cuts`` takes,
+    named ``<seconds>s_<mode>_gemini``.
+    """
+    from ..story import edit_plan as call2
+
+    audio, video, desc = described["audio"], described["video"], described["record"]["described"]
+    prep = job.units_json.parent
+    fp = described["record"]["fingerprint"]
+    stored = {} if cfg.refresh_edits else call2.load(prep, fp)
+    source = video[-1].end
+    for mode in cfg.cut_modes:
+        missing = [d for d in cfg.cut_durations if d < source and call2.name(d, mode) not in stored]
+        if not missing:
+            continue
+        if not api_key:
+            log(f"  ✗ {mode}: no stored edit for {', '.join(f'{d:g}s' for d in missing)} and no Gemini key given")
+            continue
+        try:
+            stored.update(call2.request(audio, video, desc, missing, mode, api_key, cfg.gemini_model,
+                                        cfg.gemini_api_version, log))
+            call2.save(prep, fp, stored)
+        except call2.GeminiError as e:
+            log(f"  ✗ {mode}: {e}")
+    talk = load_talk(job)
+    cuts: Dict[str, Dict[str, Any]] = {}
+    for d in cfg.cut_durations:
+        for mode in cfg.cut_modes:
+            key = call2.name(d, mode)
+            if d >= source:
+                log(f"  {key}: skipped, the video is only {source:.1f}s long")
+            elif key in stored:
+                cuts[key + "_gemini"] = call2.build_cut(audio, video, desc, stored[key], talk)
+    return cuts

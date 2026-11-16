@@ -144,6 +144,8 @@ class PipelineConfig:
     # Cutdowns to render next to the full-length outputs: every duration x mode x target becomes a video.
     cut_durations: List[float] = field(default_factory=list)  # seconds, e.g. [15, 10]; empty = no cutdowns
     cut_modes: List[str] = field(default_factory=lambda: ["synced", "cutaway"])
+    cut_brain: str = "gemini"    # who builds the edit: "gemini" (two calls: describe, then edit) | "code" (story map + selector)
+    refresh_edits: bool = False  # gemini brain: ask call 2 again even if an edit is stored for this length and mode
     cut_params: Dict[str, Any] = field(default_factory=dict)  # selector settings (fovea/story/select.py), e.g. {"cut_penalty": 1}
 
     # ------------------------------------------------------------------ limits
@@ -169,6 +171,8 @@ class PipelineConfig:
             raise ValueError("cut_durations must be positive numbers of seconds")
         if not self.cut_modes or any(m not in ("synced", "cutaway") for m in self.cut_modes):
             raise ValueError("cut_modes must be 'synced' and/or 'cutaway'")
+        if self.cut_brain not in ("gemini", "code"):
+            raise ValueError("cut_brain must be 'gemini' or 'code'")
         self.detect_every = max(1, int(self.detect_every))
         self.max_shards = max(1, int(self.max_shards))
         for name in ("visual_workers", "ocr_workers", "motion_workers", "whisper_batch_size"):

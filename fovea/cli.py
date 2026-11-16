@@ -76,7 +76,12 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="synced = sound stays with its picture; cutaway = other pictures may cover a line (default: both)")
     c.add_argument("--gemini-key", default=None,
                    help="Gemini API key (or set GEMINI_API_KEY). Only needed the first time a video file is seen")
-    c.add_argument("--cut-penalty", type=float, default=None, help="Higher = fewer, longer pieces (default 3)")
+    c.add_argument("--brain", choices=["gemini", "code"], default=d.cut_brain, dest="cut_brain",
+                   help="Who builds the edit. gemini (default): call 1 describes the video once, call 2 builds each "
+                        "edit. code: the older story map + selector")
+    c.add_argument("--refresh-edits", action="store_true",
+                   help="gemini brain: ask call 2 again even if an edit is stored for this length and mode")
+    c.add_argument("--cut-penalty", type=float, default=None, help="code brain: higher = fewer, longer pieces (default 3)")
     c.add_argument("--arc-importance", type=float, default=None,
                    help="Units Gemini scores at or above this are always kept (default 8)")
     c.add_argument("--no-hook", action="store_true", help="Never move Gemini's hook to the front")
@@ -185,6 +190,7 @@ def main(argv=None) -> None:
         cut_threshold_px=args.cut_threshold_px, still_deadband_px=args.still_deadband_px,
         debug_renders=args.debug_renders, force=args.force,
         cut_durations=args.cut_durations, cut_modes=args.cut_modes,
+        cut_brain=args.cut_brain, refresh_edits=args.refresh_edits,
         cut_params={k: v for k, v in (("cut_penalty", args.cut_penalty), ("arc_importance", args.arc_importance),
                                       ("use_hook", False if args.no_hook else None)) if v is not None},
     )

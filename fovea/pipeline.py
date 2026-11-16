@@ -61,6 +61,10 @@ def run(video_path: str | Path, config: Optional[PipelineConfig] = None, gemini_
     if cfg.cut_durations:
         fp, stored_units, _ = steps.story.lookup(job, cfg)
         need_story = stored_units is None
+        if cfg.cut_brain == "gemini":
+            from .story import describe as call1
+
+            need_story = cfg.refresh_story or call1.load(job.units_json.parent, fp) is None
         # The folder is named after the file name: never cut a video using another file's analysis.
         if job.video_info.exists() and job.read_json(job.video_info).get("sha256") not in (None, fp):
             print("  this folder holds the analysis of a different file with the same name: re-running it")
@@ -122,6 +126,13 @@ def _render_cuts(job: JobDir, cfg: PipelineConfig, key: Optional[str], audio_fut
         if audio_future is not None:
             print("  waiting for the transcript", flush=True)
             audio_future.result()
+        if cfg.cut_brain == "gemini":
+            from .story import edit_plan as call2
+
+            cuts = steps.story.plan_edits(job, cfg, steps.story.describe(job, cfg, key), key)
+            job.write_json(job.framing_dir / "cuts_gemini.json", cuts)
+            print(call2.report(cuts), flush=True)
+            return steps.render.run_cuts(job, cfg, cuts)
         story = steps.story.run(job, cfg, key)
         cuts = make_cuts(story["units"], story["record"]["story_map"], cfg.cut_durations, cfg.cut_modes,
                          **cfg.cut_params)

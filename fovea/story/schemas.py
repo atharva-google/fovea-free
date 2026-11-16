@@ -1,7 +1,7 @@
 """The output schemas of the two Gemini calls. Gemini is made to answer in exactly these shapes.
 
     call 1  Units      once per input FILE (stored): describes every unit of that file
-    call 2  Timelines  text only: arranges units from one or more files into finished edits
+    call 2  SyncedEdits / CutawayEdits   text only: one edit per requested length (one request per mode)
 
 Call 1 is the only time anything LOOKS at the footage: it says what happens in every unit and
 which earlier units it depends on. Call 2 decides what to keep.
@@ -65,28 +65,30 @@ class Units(BaseModel):
     audio_units: List[AudioUnit]
 
 
-# =========================================================================== call 2: Timelines
-class Mode(str, Enum):
-    synced = "synced"    # every sound plays with the picture it was recorded with
-    cutaway = "cutaway"  # a sound may play over a different picture
-
-
-class Segment(BaseModel):
-    audio: str = Field(description="The audio unit heard here, e.g. F1.A04. Empty string = the sound recorded "
-                                   "with the picture in `video`.")
-    video: str = Field(description="The video unit seen here, e.g. F1.V03. Empty string = the picture the sound in "
-                                   "`audio` was recorded with. A video unit is used at most once per timeline. "
-                                   "Never put someone else's speech over a face that is visibly talking.")
-
-
-class Timeline(BaseModel):
+# =========================================================================== call 2: the edits
+# One request per mode. Gemini sees call 1's stored descriptions (no video) and the requested lengths.
+class SyncedEdit(BaseModel):
     target_s: float = Field(description="The length that was asked for.")
-    mode: Mode
-    segments: List[Segment] = Field(description="In playing order. Anything not listed is cut.")
-    music: str = Field(description="File id of a music track to play under the whole timeline, e.g. F3. "
-                                   "Empty string = keep whatever music the sounds already carry.")
-    story: str = Field(description="One or two sentences: how the story holds, and what was lost to get to this length.")
+    segments: List[str] = Field(description="Segment ids (S01, S02, ...) to keep, in playing order. "
+                                            "Segments not listed are cut.")
+    story: str = Field(description="One or two sentences: how the story holds, and what was cut to get here.")
 
 
-class Timelines(BaseModel):
-    timelines: List[Timeline] = Field(description="Exactly one per requested length and mode.")
+class SyncedEdits(BaseModel):
+    edits: List[SyncedEdit] = Field(description="Exactly one per requested length.")
+
+
+class CutawaySegment(BaseModel):
+    audio: str = Field(description="The audio unit heard here, e.g. A04.")
+    video: str = Field(description="The video unit (shot) SEEN while it plays, e.g. V03. Empty string = the picture "
+                                   "this sound was recorded with.")
+
+
+class CutawayEdit(BaseModel):
+    target_s: float = Field(description="The length that was asked for.")
+    segments: List[CutawaySegment] = Field(description="In playing order. Audio units not listed are cut.")
+    story: str = Field(description="One or two sentences: how the story holds, and what was cut to get here.")
+
+
+class CutawayEdits(BaseModel):
+    edits: List[CutawayEdit] = Field(description="Exactly one per requested length.")
