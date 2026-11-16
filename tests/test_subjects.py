@@ -5,7 +5,8 @@
 
 import unittest
 
-from fovea.framing.subjects import person_score, speaking_frames
+from fovea.framing.subjects import (fill_track_gaps, person_score, shot_motion_cx, speaker_score,
+                                    speaking_frames, watermark_indices)
 
 
 def track(tid, scores, shot=0, start=0):
@@ -47,6 +48,16 @@ class SpeakingTest(unittest.TestCase):
         got = speaking_frames([track(2, [2.0] * 40)], {(0, f, 2): 30 * 30 for f in range(40)})
         self.assertEqual(len(frames_of(got, 2)), 40)      # small, but the only face: it may speak
 
+    def test_a_face_a_quarter_the_size_of_the_main_face_is_not_the_speaker(self):
+        # the frame from a real ad: a large central face (238x237) and a man behind (123x122) scored as speaking
+        area = {(0, f, 1): 238 * 237 for f in range(40)}
+        area.update({(0, f, 3): 123 * 122 for f in range(40)})
+        got = speaking_frames([track(1, [-0.5] * 40), track(3, [1.5] * 40)], area)
+        self.assertEqual(got, {})
+
+    def test_barely_positive_is_not_speech(self):
+        self.assertEqual(speaking_frames([track(1, [0.05] * 40)]), {})
+
     def test_shots_do_not_mix(self):
         got = speaking_frames([track(1, [2.0] * 30, shot=0), track(1, [2.0] * 30, shot=1)])
         self.assertEqual({s for (s, _, _) in got}, {0, 1})
@@ -65,6 +76,77 @@ class ProminenceTest(unittest.TestCase):
         self.assertGreater(person_score(0.1, 0.5, 1.0), base)
         self.assertLessEqual(person_score(5.0, -1.0, 9.0), 0.9)      # never near a speaker's 2.0
         self.assertGreaterEqual(person_score(0.0, 1.0, 0.0), 0.5)    # never below text / motion fallbacks
+
+
+class SpeakerBoostTest(unittest.TestCase):
+    def test_in_a_conversation_between_similar_faces_the_speaker_clearly_wins(self):
+        silent = person_score(0.2, 0.3, 1.0)
+        self.assertGreater(speaker_score(person_score(0.2, 0.4, 1.0), rel_face=0.9, asd=0.8), 1.8 * silent)
+
+    def test_speaking_helps_a_small_face_much_less(self):
+        base = person_score(0.2, 0.3, 1.0)
+        self.assertLess(speaker_score(base, rel_face=0.3), 1.15 * base)
+        self.assertGreater(speaker_score(base, rel_face=1.0), 2.0 * base)
+
+
+def det(tid, x, cname="person", w=100, face=True):
+    d = {"track_id": tid, "cname": cname, "bbox": [x, 100, x + w, 400], "conf": 0.8}
+    if face:
+        d["face_bbox"] = [x + 10, 110, x + 60, 170]
+    return d
+
+
+class GapsTest(unittest.TestCase):
+    def test_a_person_lost_between_two_sightings_is_filled_in(self):
+        data = {10: [det(1, 100)], 14: [det(1, 140)]}
+        out = fill_track_gaps(data, range(10, 15))
+        self.assertEqual([len(out[f]) for f in range(10, 15)], [1] * 5)
+        self.assertEqual(out[12][0]["bbox"][0], 120)                 # moves evenly
+        self.assertEqual(out[12][0]["face_bbox"][0], 130)
+        self.assertTrue(out[12][0]["filled"])
+        self.assertNotIn(12, data)                                   # the input is not changed
+
+    def test_frames_with_nobody_borrow_the_nearest_people(self):
+        # the pattern from a real close-up: nobody, a person, a long dropout, the person again
+        data = {f: [det(1, 0)] for f in [533, 534, 535, 536, 551, 552]}
+        out = fill_track_gaps(data, range(531, 557))
+        self.assertTrue(all(any(d["cname"] == "person" for d in out[f]) for f in range(531, 557)))
+        self.assertTrue(out[531][0]["filled"] and out[556][0]["filled"])
+        self.assertFalse(out[533][0].get("filled"))
+
+    def test_a_long_absence_is_not_filled_and_a_filled_person_never_speaks(self):
+        data = {0: [{**det(1, 100), "speaking": True, "asd_score": 1.0}], 60: [det(1, 100)]}
+        out = fill_track_gaps(data, range(0, 61))
+        self.assertEqual(out[30], [])
+        self.assertFalse(out[10][0]["speaking"])                     # borrowed for the first 25 frames only
+        self.assertEqual(out[26], [])
+
+
+class WatermarkTest(unittest.TestCase):
+    def test_text_in_the_same_corner_in_many_shots_is_a_logo(self):
+        boxes = [(s, 0.10, 0.15) for s in range(8)] + [(3, 0.5, 0.8), (5, 0.52, 0.2)]
+        self.assertEqual(watermark_indices(boxes, n_shots=20), set(range(8)))
+
+    def test_text_seen_in_one_or_two_shots_is_kept(self):
+        self.assertEqual(watermark_indices([(0, 0.5, 0.5), (1, 0.5, 0.5), (2, 0.1, 0.9)], n_shots=10), set())
+        self.assertEqual(watermark_indices([], n_shots=10), set())
+
+    def test_in_a_long_video_three_shots_are_not_enough(self):
+        boxes = [(s, 0.1, 0.1) for s in range(3)]
+        self.assertEqual(watermark_indices(boxes, n_shots=40), set())   # needs a quarter of the shots
+
+
+class ShotMotionTest(unittest.TestCase):
+    def test_slow_movement_adds_up_over_the_shot(self):
+        motion = {f: {"motion_cx": 900.0, "instant_density": 0.07, "motion_weight": 0.0} for f in range(30)}
+        self.assertAlmostEqual(shot_motion_cx(motion, range(30)), 900.0)
+
+    def test_a_still_shot_or_a_brief_flicker_has_no_motion(self):
+        still = {f: {"motion_cx": 640.0, "instant_density": 0.01, "motion_weight": 0.0} for f in range(30)}
+        self.assertIsNone(shot_motion_cx(still, range(30)))
+        flicker = {**still, 5: {"motion_cx": 100.0, "instant_density": 0.5, "motion_weight": 0.5}}
+        self.assertIsNone(shot_motion_cx(flicker, range(30)))
+        self.assertIsNone(shot_motion_cx({}, range(30)))
 
 
 if __name__ == "__main__":
