@@ -27,7 +27,7 @@ from .describe import REQUEST_TIMEOUT_S, GeminiError
 from .pieces import AudioUnit, VideoUnit
 from .select import Piece, merge_pieces
 
-CALL2_VERSION = 2
+CALL2_VERSION = 3
 CALL2_FILE = "call2.json"
 MIN_COVER = 0.8      # a cover picture shorter than this is not worth a cut
 MODES = ("synced", "cutaway")
@@ -87,8 +87,8 @@ the sound was recorded over. Do not start from a synced edit; build it this way:
   1. Choose the SOUNDS that tell the story (the lines that must be heard).
   2. Choose the SHOTS that must be seen (the product, the reveal, the result, the closing card).
   3. Lay those shots over the chosen sounds. Good sounds to cover: voiceover and narration (nobody is seen saying
-     it), a line by someone we have already seen, music or silence. Good shots to cover with: the product, an
-     object, a reaction, a result: shots with "visibly talking" near 0%.
+     it), a line by someone we have already seen, music or silence. Only shots marked "CAN COVER" may be used,
+     and only for sounds no longer than the seconds given there; any other choice is thrown away.
   4. Usually drop the audio units recorded over a shot you used as a cover: that is where the time is saved.
 
 How to use cutaways:
@@ -97,8 +97,8 @@ How to use cutaways:
 - Footage is never shown twice. If a shot covers a sound AND some of its own audio units are kept, the cover only
   gets what is left of the shot, so prefer covering with shots whose own audio you are cutting.
 - A covering shot may cover several audio units; it keeps playing from where it left off.
-- The picture is shown for exactly as long as the sound lasts. Check the lengths: a 1.2s shot cannot cover 3s.
-- Never cover speech with a shot in which someone else is visibly talking ("visibly talking" near 100%).
+- The picture is shown for exactly as long as the sound lasts. Check the lengths against "CAN COVER up to".
+- A shot marked "cannot cover" shows someone talking; putting another sound over it looks wrong. Never use it.
 - A sound that belongs to what is seen, like (door slams), stays with its own picture.
 - Do not cover a line when seeing the person say it is the point (a reaction, a punchline delivered to camera).
 
@@ -134,11 +134,23 @@ def synced_prompt(audio: List[AudioUnit], video: List[VideoUnit], described: Dic
     return _fill(SYNCED_PROMPT, described, video, targets, shots=shots, segments=segs)
 
 
+def cover_room(v: VideoUnit, talk: Sequence[Span]) -> float:
+    """Seconds of this shot usable as a cover in one go: its longest stretch without a talking face
+    (0 if that is too short to be worth a cut)."""
+    longest = max((b - a for a, b in quiet_spans(v, talk)), default=0.0)
+    return longest if longest >= MIN_COVER else 0.0
+
+
 def cutaway_prompt(audio: List[AudioUnit], video: List[VideoUnit], described: Dict[str, Any],
-                   targets: Sequence[float]) -> str:
+                   targets: Sequence[float], talk: Sequence[Span] = ()) -> str:
     dv = {u["id"]: u for u in described["video_units"]}
     da = {u["id"]: u for u in described["audio_units"]}
-    vid = "\n".join(f"{v.id} | {v.dur:.2f}s | visibly talking: {v.talking:.0%} | shows: {dv[v.id]['shows']} | "
+
+    def can_cover(v: VideoUnit) -> str:
+        room = cover_room(v, talk)
+        return f"CAN COVER up to {room:.1f}s" if room else "cannot cover (a face is talking)"
+
+    vid = "\n".join(f"{v.id} | {v.dur:.2f}s | {can_cover(v)} | shows: {dv[v.id]['shows']} | "
                     f"focus: {dv[v.id]['focus']}{_needs(dv[v.id]['needs'], False)}" for v in video)
     aud = "\n".join(f"{a.id} | {a.dur:.2f}s | over {' '.join(a.over)} | heard: {da[a.id]['heard']}"
                     f"{_needs(da[a.id]['needs'], False)}" for a in audio)
@@ -158,7 +170,7 @@ def _fill(template: str, described: Dict[str, Any], all_shots: List[VideoUnit], 
 # =========================================================================== the Gemini call
 def request(audio: List[AudioUnit], video: List[VideoUnit], described: Dict[str, Any], targets: Sequence[float],
             mode: str, api_key: str, model: str = "gemini-3.8-flash", api_version: str = "v1beta",
-            log: Callable[[str], None] = print) -> Dict[str, Dict[str, Any]]:
+            log: Callable[[str], None] = print, talk: Sequence[Span] = ()) -> Dict[str, Dict[str, Any]]:
     """One text-only request for ``mode``. Returns ``{"15s_synced": {"target_s", "mode", "segments",
     "story", "model"}}`` with ``segments`` as ``[{"audio", "video"}]`` in both modes."""
     if mode not in MODES:
@@ -173,7 +185,8 @@ def request(audio: List[AudioUnit], video: List[VideoUnit], described: Dict[str,
     except ImportError as e:
         raise GeminiError(f"google-genai (and pydantic) must be installed: pip install -U google-genai ({e})") from e
 
-    text = (synced_prompt if mode == "synced" else cutaway_prompt)(audio, video, described, targets)
+    text = (synced_prompt(audio, video, described, targets) if mode == "synced"
+            else cutaway_prompt(audio, video, described, targets, talk))
     schema = SyncedEdits if mode == "synced" else CutawayEdits
     http = {"timeout": REQUEST_TIMEOUT_S * 1000}
     if api_version:

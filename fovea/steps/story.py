@@ -201,6 +201,10 @@ def plan_edits(job: JobDir, cfg: PipelineConfig, described: Dict[str, Any], api_
     fp = described["record"]["fingerprint"]
     stored = {} if cfg.refresh_edits else call2.load(prep, fp)
     source = video[-1].end
+    talk = load_talk(job)
+    usable = [v.id for v in video if call2.cover_room(v, talk)]
+    if "cutaway" in cfg.cut_modes:
+        log(f"  shots usable as a cover (a stretch without a talking face): {' '.join(usable) or 'NONE'}")
     for mode in cfg.cut_modes:
         missing = [d for d in cfg.cut_durations if d < source and call2.name(d, mode) not in stored]
         if not missing:
@@ -210,11 +214,10 @@ def plan_edits(job: JobDir, cfg: PipelineConfig, described: Dict[str, Any], api_
             continue
         try:
             stored.update(call2.request(audio, video, desc, missing, mode, api_key, cfg.gemini_model,
-                                        cfg.gemini_api_version, log))
+                                        cfg.gemini_api_version, log, talk))
             call2.save(prep, fp, stored)
         except call2.GeminiError as e:
             log(f"  ✗ {mode}: {e}")
-    talk = load_talk(job)
     cuts: Dict[str, Dict[str, Any]] = {}
     for d in cfg.cut_durations:
         for mode in cfg.cut_modes:

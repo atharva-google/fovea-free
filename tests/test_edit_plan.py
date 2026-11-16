@@ -46,9 +46,12 @@ class PromptTest(unittest.TestCase):
 
     def test_cutaway_prompt_gives_the_two_tracks_separately(self):
         audio, video, described, hope, sweater = setup()
-        text = call2.cutaway_prompt(audio, video, described, [10])
-        self.assertIn("V03 | 3.00s | visibly talking: 0% | shows: a red sweater in the box; tag reads 'For you' | "
+        text = call2.cutaway_prompt(audio, video, described, [10], TALK)
+        self.assertIn("V03 | 3.00s | CAN COVER up to 3.0s | shows: a red sweater in the box; tag reads 'For you' | "
                       f"focus: the sweater | needs {sweater}", text)
+        self.assertIn("V01 | 4.00s | CAN COVER up to 1.3s |", text)             # only her silent reaction
+        busy = call2.cutaway_prompt(audio, video, described, [10], [(0.0, 3.5)])
+        self.assertIn("V01 | 4.00s | cannot cover (a face is talking) |", busy)
         self.assertIn(f"{sweater} | 1.11s | over V02 | heard: A sweater. | needs {hope}", text)
 
 
