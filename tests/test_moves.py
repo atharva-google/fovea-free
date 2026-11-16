@@ -45,6 +45,22 @@ class CameraMovesTest(unittest.TestCase):
         self.assertEqual(cx[0], 400)                                   # where it was followed longest
         self.assertEqual(set(modes[1:]), {"camera_hold"})
 
+    def test_a_short_shot_frames_the_person_even_if_text_was_followed_longer(self):
+        raw = [1400] * 16 + [600] * 10                                 # text, then a person appears
+        tags = ["ocr_text"] * 16 + ["person_4"] * 10
+        cx, _ = plan(raw, tags)
+        self.assertEqual((travel(cx), cx[0]), (0, 600))
+
+    def test_a_person_seen_for_only_a_few_frames_does_not_take_a_short_shot(self):
+        raw = [1400] * 23 + [600] * 3
+        cx, _ = plan(raw, ["ocr_text"] * 23 + ["person_4"] * 3)
+        self.assertEqual(cx[0], 1400)
+
+    def test_in_a_short_shot_a_speaker_comes_before_a_silent_person(self):
+        raw = [500] * 18 + [1200] * 12
+        cx, _ = plan(raw, ["person_1"] * 18 + ["speaker_2"] * 12)
+        self.assertEqual(cx[0], 1200)
+
     def test_a_real_move_becomes_one_pan_that_arrives(self):
         cx, modes = plan([700] * 50 + [1100] * 70)
         self.assertEqual((cx[0], cx[49]), (700, 700))
