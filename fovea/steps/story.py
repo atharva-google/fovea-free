@@ -205,6 +205,7 @@ def plan_edits(job: JobDir, cfg: PipelineConfig, described: Dict[str, Any], api_
     usable = [v.id for v in video if call2.cover_room(v, talk)]
     if "cutaway" in cfg.cut_modes:
         log(f"  shots usable as a cover (a stretch without a talking face): {' '.join(usable) or 'NONE'}")
+    todo = []
     for mode in cfg.cut_modes:
         missing = [d for d in cfg.cut_durations if d < source and call2.name(d, mode) not in stored]
         if not missing:
@@ -212,12 +213,19 @@ def plan_edits(job: JobDir, cfg: PipelineConfig, described: Dict[str, Any], api_
         if not api_key:
             log(f"  ✗ {mode}: no stored edit for {', '.join(f'{d:g}s' for d in missing)} and no Gemini key given")
             continue
-        try:
-            stored.update(call2.request(audio, video, desc, missing, mode, api_key, cfg.gemini_model,
-                                        cfg.gemini_api_version, log, talk))
-            call2.save(prep, fp, stored)
-        except call2.GeminiError as e:
-            log(f"  ✗ {mode}: {e}")
+        todo.append((mode, missing))
+    if todo:   # the modes are independent requests: ask for them at the same time
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=len(todo), thread_name_prefix="call2") as pool:
+            jobs = [(mode, pool.submit(call2.request, audio, video, desc, missing, mode, api_key, cfg.gemini_model,
+                                       cfg.gemini_api_version, log, talk)) for mode, missing in todo]
+            for mode, job_ in jobs:
+                try:
+                    stored.update(job_.result())
+                    call2.save(prep, fp, stored)
+                except call2.GeminiError as e:
+                    log(f"  ✗ {mode}: {e}")
     cuts: Dict[str, Dict[str, Any]] = {}
     for d in cfg.cut_durations:
         for mode in cfg.cut_modes:

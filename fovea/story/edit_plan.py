@@ -240,7 +240,10 @@ def request(audio: List[AudioUnit], video: List[VideoUnit], described: Dict[str,
         resp = client.models.generate_content(
             model=model, contents=[text],
             config=types.GenerateContentConfig(response_mime_type="application/json", response_schema=schema))
-        log(f"  answered in {time.time() - t0:.1f}s")
+        usage = getattr(resp, "usage_metadata", None)
+        log(f"  call 2 ({mode}) answered in {time.time() - t0:.1f}s | tokens in={getattr(usage, 'prompt_token_count', None)} "
+            f"out={getattr(usage, 'candidates_token_count', None)} "
+            f"thinking={getattr(usage, 'thoughts_token_count', None)}")
         raw = json.loads(resp.text or "")
     except ValueError:
         raise GeminiError("Gemini's answer was not valid JSON (it may have been cut off); run the command again")
