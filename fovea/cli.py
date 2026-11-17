@@ -3,6 +3,9 @@
     python -m fovea run input.mp4                       # 9:16 vertical
     python -m fovea run input.mp4 -t 9:16 1:1 4:5       # several formats, one analysis
     python -m fovea run input.mp4 -t 720x720            # exact pixel size
+    python -m fovea run input.mp4 -t 9:16 --cut 15 10   # + 15 s and 10 s cutdowns (needs a Gemini key once per video)
+    python -m fovea story input.mp4 -d 15 10            # story map + proposed cuts (prints, renders nothing)
+    python -m fovea describe input.mp4                  # two-call pipeline, call 1: describe every unit
     python -m fovea download [--all]                    # fetch model weights
     python -m fovea weights                             # show which weights are present
 """
@@ -32,8 +35,10 @@ def _build_parser() -> argparse.ArgumentParser:
                         f"({', '.join(PRESETS)}). Default: 9:16")
     r.add_argument("--short-side", type=int, default=d.short_side,
                    help="Output short side in px when a ratio is given (default 1080)")
-    r.add_argument("-o", "--output-dir", type=Path, default=d.output_dir)
-    r.add_argument("--work-dir", type=Path, default=d.work_dir)
+    r.add_argument("-o", "--output-dir", type=Path, default=d.output_dir,
+                   help="Also copy the final videos here (default: they stay in <work-dir>/<video name>/outputs/)")
+    r.add_argument("--work-dir", type=Path, default=d.work_dir,
+                   help="Data folder: each video gets ONE folder in it, <video name>/, with everything about it")
     r.add_argument("--weights-dir", type=Path, default=d.weights_dir)
     r.add_argument("--device", choices=["cuda", "mps", "cpu"], default=None)
 
@@ -64,9 +69,76 @@ def _build_parser() -> argparse.ArgumentParser:
     f.add_argument("--cut-threshold", type=float, default=d.cut_threshold_px, dest="cut_threshold_px")
     f.add_argument("--deadband", type=float, default=d.still_deadband_px, dest="still_deadband_px")
 
+    c = r.add_argument_group("cutdowns (shorter versions; see `fovea story`)")
+    c.add_argument("--cut", nargs="+", type=float, default=[], dest="cut_durations", metavar="SECONDS",
+                   help="Also render cutdowns of these lengths, e.g. --cut 15 10")
+    c.add_argument("--cut-modes", nargs="+", choices=["synced", "cutaway"], default=d.cut_modes,
+                   help="synced = sound stays with its picture; cutaway = other pictures may cover a line (default: both)")
+    c.add_argument("--gemini-key", default=None,
+                   help="Gemini API key (or set GEMINI_API_KEY). Only needed the first time a video file is seen")
+    c.add_argument("--brain", choices=["gemini", "code"], default=d.cut_brain, dest="cut_brain",
+                   help="Who builds the edit. gemini (default): call 1 describes the video once, call 2 builds each "
+                        "edit. code: the older story map + selector")
+    c.add_argument("--refresh-edits", action="store_true",
+                   help="gemini brain: ask call 2 again even if an edit is stored for this length and mode")
+    c.add_argument("--cut-penalty", type=float, default=None, help="code brain: higher = fewer, longer pieces (default 3)")
+    c.add_argument("--arc-importance", type=float, default=None,
+                   help="Units Gemini scores at or above this are always kept (default 8)")
+    c.add_argument("--no-hook", action="store_true", help="Never move Gemini's hook to the front")
+
+    c.add_argument("--gemini-framing", action="store_true",
+                   help="Optional extra Gemini call: show it where the picture would be centred and let it correct "
+                        "shots where that is wrong (needs a key the first time; separate from the cutdown calls)")
+
     m = r.add_argument_group("misc")
     m.add_argument("--debug-renders", action="store_true", help="Write annotated tracking/motion videos")
     m.add_argument("--force", action="store_true", help="Recompute every stage even if outputs exist")
+
+    # -------------------------------------------------------------- story
+    st = sub.add_parser("story", help="Story map for cutdowns: units, Gemini's map, and the cuts picked from it "
+                                      "(prints only, renders nothing)")
+    st.add_argument("video", help="Path to the input video")
+    st.add_argument("-d", "--durations", nargs="+", type=float, default=[15.0],
+                    help="Target lengths in seconds to pick cuts for (default: 15)")
+    st.add_argument("--modes", nargs="+", choices=["synced", "cutaway"], default=["synced", "cutaway"],
+                    help="synced = sound stays with its picture; cutaway = other pictures may cover a line")
+    st.add_argument("--gemini-key", default=None,
+                    help="Gemini API key (or set GEMINI_API_KEY). Only needed the first time a video file is seen")
+    st.add_argument("--gemini-model", default=d.gemini_model)
+    st.add_argument("--video-processing", choices=["AGENTIC", "STATIC"], default=d.gemini_video_processing,
+                    dest="gemini_video_processing")
+    st.add_argument("--refresh", action="store_true", help="Ask Gemini again even if a story map is stored")
+    st.add_argument("--json", type=Path, default=None, dest="json_out",
+                    help="Also write units, story map and cuts to this JSON file")
+    st.add_argument("--work-dir", type=Path, default=d.work_dir,
+                    help="Data folder: each video gets ONE folder in it, <video name>/, with everything about it")
+    st.add_argument("--weights-dir", type=Path, default=d.weights_dir)
+    st.add_argument("--device", choices=["cuda", "mps", "cpu"], default=None)
+    st.add_argument("--whisper-model", default=d.whisper_model)
+    k = st.add_argument_group("selector (change and re-run: no Gemini call, no re-analysis)")
+    k.add_argument("--cut-penalty", type=float, default=3.0, help="Higher = fewer, longer pieces (default 3)")
+    k.add_argument("--arc-importance", type=float, default=8.0,
+                   help="Units Gemini scores at or above this are always kept (default 8)")
+    k.add_argument("--min-importance", type=float, default=1.0, help="Units below this are never picked (default 1)")
+    k.add_argument("--imp-power", type=float, default=1.5, help="Higher = importance outweighs length more (default 1.5)")
+    k.add_argument("--dur-power", type=float, default=0.5)
+    k.add_argument("--tolerance", type=float, default=0.1, help="How far under the target still counts as on target")
+    k.add_argument("--over-tolerance", type=float, default=0.15,
+                   help="How far over the target optional material may go (the story itself may go further)")
+    k.add_argument("--no-hook", action="store_true", help="Never move Gemini's hook to the front")
+
+    # ----------------------------------------------------------- describe
+    ds = sub.add_parser("describe", help="Call 1 of the two-call pipeline: Gemini watches the video once and "
+                                         "describes every shot and every piece of sound (prints, renders nothing)")
+    ds.add_argument("video", help="Path to the input video")
+    ds.add_argument("--gemini-key", default=None,
+                    help="Gemini API key (or set GEMINI_API_KEY). Not needed once a video has been described")
+    ds.add_argument("--gemini-model", default=d.gemini_model)
+    ds.add_argument("--refresh", action="store_true", help="Ask Gemini again even if an answer is stored")
+    ds.add_argument("--work-dir", type=Path, default=d.work_dir)
+    ds.add_argument("--weights-dir", type=Path, default=d.weights_dir)
+    ds.add_argument("--device", choices=["cuda", "mps", "cpu"], default=None)
+    ds.add_argument("--whisper-model", default=d.whisper_model)
 
     # ----------------------------------------------------------- download
     dl = sub.add_parser("download", help="Download model weights")
@@ -99,6 +171,14 @@ def main(argv=None) -> None:
             print(f"{mark} {row['key']:<10} {row['used_by']:<11} {row['license']:<11} {row['path']}")
         return
 
+    if args.command == "story":
+        _story(args)
+        return
+
+    if args.command == "describe":
+        _describe(args)
+        return
+
     from .pipeline import run
 
     cfg = PipelineConfig(
@@ -113,11 +193,148 @@ def main(argv=None) -> None:
         focal_strategy=args.focal_strategy, pan_window_frames=args.pan_window_frames,
         cut_threshold_px=args.cut_threshold_px, still_deadband_px=args.still_deadband_px,
         debug_renders=args.debug_renders, force=args.force,
+        cut_durations=args.cut_durations, cut_modes=args.cut_modes,
+        cut_brain=args.cut_brain, refresh_edits=args.refresh_edits, gemini_framing=args.gemini_framing,
+        cut_params={k: v for k, v in (("cut_penalty", args.cut_penalty), ("arc_importance", args.arc_importance),
+                                      ("use_hook", False if args.no_hook else None)) if v is not None},
     )
-    outputs = run(args.video, cfg)
+    from .steps.story import StoryKeyRequired
+
+    try:
+        outputs = run(args.video, cfg, gemini_api_key=args.gemini_key)
+    except StoryKeyRequired as e:
+        raise SystemExit(str(e)) from None
     print("\nDone:")
     for o in outputs:
         print(f"  {o}")
+
+
+def _describe(args) -> None:
+    """``fovea describe``: call 1. Stored answer if this video has one, else analysis + one Gemini call."""
+    import os
+
+    from .story import describe as call1
+    from .story import store
+
+    video = Path(args.video)
+    if not video.is_file():
+        raise SystemExit(f"Input video not found: {video}")
+    cfg = PipelineConfig(weights_dir=args.weights_dir, work_dir=args.work_dir, device=args.device, transcribe=True,
+                         whisper_model=args.whisper_model, gemini_model=args.gemini_model, refresh_story=args.refresh)
+    fp = store.fingerprint(video)
+    job_root = cfg.work_dir / video.stem
+    found = None if cfg.refresh_story else call1.load(job_root / "prep", fp)
+    if found:
+        audio, units, record = found
+        print(f"Call 1 for {video.name} already stored in {job_root / 'prep'}: no analysis, no Gemini call\n")
+    else:
+        key = args.gemini_key or os.environ.get("GEMINI_API_KEY")
+        if not key:
+            raise SystemExit("This video has not been described yet, so a Gemini key is needed: "
+                             "pass --gemini-key or set GEMINI_API_KEY")
+        from . import steps
+        from .utils.device import get_device
+        from .utils.jobdir import JobDir
+
+        device = get_device(cfg.device)
+        job = JobDir(job_root)
+        job.set_source(video)
+        if job.video_info.exists() and job.read_json(job.video_info).get("sha256") not in (None, fp):
+            print("  this folder holds the analysis of a different file with the same name: re-running it")
+            cfg.force = True
+        if not job.job_json.exists():
+            job.write_json(job.job_json, {"config": {"targets": cfg.targets}})
+        print(f"Fovea describe | device={device} | job folder: {job.root}")
+        print("▶ analysis: prep, visual, audio (steps already done for this folder are skipped)", flush=True)
+        for i in range(steps.prep.run(job, cfg)):
+            steps.visual.run(job, cfg, device, i)
+        steps.audio.run(job, cfg, device)
+        print("▶ call 1", flush=True)
+        try:
+            out = steps.story.describe(job, cfg, key)
+        except Exception as e:  # noqa: BLE001 - show the reason, not a stack trace
+            raise SystemExit(f"Call 1 failed: {e}") from None
+        audio, units, record = out["audio"], out["video"], out["record"]
+        print()
+    if record.get("issues"):
+        print(f"Fixed while reading the answer: {'; '.join(record['issues'][:10])}\n")
+    print(call1.report(audio, units, record["described"]))
+
+
+def _story(args) -> None:
+    """``fovea story``: the stored story map if this video has one, else analysis + one Gemini call."""
+    import json
+    import os
+
+    from .story import store
+    from .story.report import format_cuts, format_story, make_cuts
+
+    video = Path(args.video)
+    if not video.is_file():
+        raise SystemExit(f"Input video not found: {video}")
+    cfg = PipelineConfig(
+        weights_dir=args.weights_dir, work_dir=args.work_dir, device=args.device,
+        transcribe=True, whisper_model=args.whisper_model, gemini_model=args.gemini_model,
+        gemini_video_processing=args.gemini_video_processing, refresh_story=args.refresh,
+    )
+    fp = store.fingerprint(video)
+    job_root = cfg.work_dir / video.stem          # the video's own folder: everything about it lives here
+    found = None if cfg.refresh_story else store.load(job_root / "prep", fp)
+    if found:
+        units, record = found
+        print(f"Story map for {video.name} already stored in {job_root / 'prep'}: no analysis, no Gemini call\n")
+    else:
+        key = args.gemini_key or os.environ.get("GEMINI_API_KEY")
+        if not key:
+            raise SystemExit("No story map is stored for this video yet, so a Gemini key is needed: "
+                             "pass --gemini-key or set GEMINI_API_KEY")
+        from . import steps
+        from .steps import story
+        from .utils.device import get_device
+        from .utils.jobdir import JobDir
+
+        device = get_device(cfg.device)
+        job = JobDir(job_root)
+        job.set_source(video)
+        # The folder is named after the file name. If it holds the analysis of a DIFFERENT file with the
+        # same name, those results must not end up in this file's story map: redo the analysis.
+        if job.video_info.exists() and job.read_json(job.video_info).get("sha256") not in (None, fp):
+            print("  this folder holds the analysis of a different file with the same name: re-running it")
+            cfg.force = True
+        if not job.job_json.exists():
+            job.write_json(job.job_json, {"config": {"targets": cfg.targets}})
+        print(f"Fovea story | device={device} | job folder: {job.root}")
+        print("▶ analysis: prep, visual, audio (steps already done for this job folder are skipped)", flush=True)
+        for i in range(steps.prep.run(job, cfg)):
+            steps.visual.run(job, cfg, device, i)
+        steps.audio.run(job, cfg, device)
+        print("▶ story map", flush=True)
+        try:
+            out = story.run(job, cfg, key)
+        except Exception as e:  # noqa: BLE001 - show the reason, not a stack trace
+            raise SystemExit(f"Story map failed: {e}") from None
+        units, record = out["units"], out["record"]
+        print()
+
+    cuts = make_cuts(units, record["story_map"], args.durations, args.modes,
+                     cut_penalty=args.cut_penalty, arc_importance=args.arc_importance,
+                     min_importance=args.min_importance, imp_power=args.imp_power, dur_power=args.dur_power,
+                     tolerance=args.tolerance, over_tolerance=args.over_tolerance, use_hook=not args.no_hook)
+    print(f"Gemini: {record.get('model')} / {record.get('processing')}, answered in {record.get('seconds')}s, "
+          f"read from its {record.get('parsed_by')}")
+    if record.get("issues"):
+        print(f"Fixed while reading the answer: {'; '.join(record['issues'][:10])}")
+    print()
+    print(format_story(units, record["story_map"]))
+    print("\nCUTS (picked by code from the story map)")
+    print(format_cuts(cuts))
+    if args.json_out:
+        args.json_out.parent.mkdir(parents=True, exist_ok=True)
+        args.json_out.write_text(json.dumps(
+            {"video": str(video), "fingerprint": fp, "units": [u.to_dict() for u in units],
+             "story_map": record["story_map"], "raw_answer": record.get("raw_answer"), "cuts": cuts},
+            indent=1, ensure_ascii=False))
+        print(f"\nWritten to {args.json_out}")
 
 
 if __name__ == "__main__":

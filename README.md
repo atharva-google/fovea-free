@@ -19,7 +19,7 @@ git clone https://github.com/YOUR_USERNAME/fovea.git && cd fovea
 pip install -r requirements.txt            # needs Python 3.9+ and ffmpeg (brew/apt install ffmpeg)
 python -m fovea download                   # model weights, one time
 python -m fovea run my_video.mp4 -t 9:16 1:1
-# → outputs/my_video_9x16.mp4, outputs/my_video_1x1.mp4
+# → ../fovea_data/my_video/outputs/9x16.mp4 and 1x1.mp4
 ```
 To run it **as a web service** on your machine (backend API + a frontend later):
 ```bash
@@ -59,6 +59,23 @@ notebooks/                 Colab quickstart + the original research notebook
 scripts/                   upload_weights_to_hf.py (publish your model weights)
 weights/                   model files (downloaded, not in git)
 ```
+
+### Where files go
+Two folders, side by side:
+```
+fovea/                 the code (from GitHub) + weights/ (the model files)
+fovea_data/            everything a run creates; the code folder is never written to
+└── <video name>/      ONE folder per video, named after the file, with everything about it
+    ├── input/           the video
+    ├── prep/            proxy, audio, shots, and for cutdowns: units.json + story_map.json
+    ├── visual/          tracking, speakers, OCR, motion
+    ├── audio/           vocals, transcript
+    ├── framing/         focal points, camera paths
+    └── outputs/         the final videos (9x16.mp4, 1x1.mp4, ...)
+```
+`fovea_data/` sits next to the code (`/content/fovea_data` on Colab); `FOVEA_HOME` moves it. `-o some/folder`
+additionally copies the final videos there as `<video name>_<format>.mp4`. The local backend keeps its uploads
+and job records in `fovea_data/backend/`. On Google Cloud, the Cloud Storage bucket takes the place of `fovea_data/`.
 
 ### How the pieces fit
 ```
@@ -102,6 +119,27 @@ from fovea import run
 run("in.mp4", targets=["9:16", "1:1"], transcribe=True)
 ```
 
+## Cutdowns: story map (work in progress)
+Shorter versions of a video are cut from a **story map**: the video is chopped into small exact pieces
+("units"), Gemini watches it once and scores / links the units, and code picks units for a target length.
+```bash
+pip install -r requirements.txt && python -m fovea download --all   # needs Whisper + Demucs + google-genai
+export GEMINI_API_KEY=...                         # only needed the first time a video file is seen
+python -m fovea run my_ad.mp4 -t 9:16 --cut 15 10 # full-length 9:16 + 15 s and 10 s cutdowns, synced and cutaway
+# → ../fovea_data/my_ad/outputs/9x16.mp4, 9x16_15s_synced.mp4, 9x16_15s_cutaway.mp4, 9x16_10s_synced.mp4, ...
+python -m fovea run my_ad.mp4 -t 9:16 --cut 15 --cut-penalty 1 --arc-importance 7   # re-cut with other settings
+python -m fovea story my_ad.mp4 -d 15 10          # only PRINT the units, Gemini's map and the cuts (no render)
+```
+- The pieces of every cutdown are saved in `fovea_data/<video name>/framing/cuts.json`. Sound is cut with the
+  picture, with a few-millisecond fade at each join (music is not treated specially yet).
+- Units and story map are stored in the video's own folder: `fovea_data/<video name>/prep/units.json` and
+  `story_map.json`. The same file always reuses them: no analysis, no Gemini call, no key. `--refresh` asks Gemini
+  again. A different video with the same file name does not inherit them (they are tied to the file's SHA-256).
+- `synced` keeps each piece's own sound; `cutaway` may show another picture while a line plays.
+- The story comes first: units Gemini scores at or above `--arc-importance` (and what they need) are always
+  kept, even if that runs past the target. `--json out.json` saves everything, including Gemini's raw answer.
+- Tests of the picking logic (no video or Gemini needed): `python -m unittest discover -s tests -v`
+
 ## Speed options
 | Option | Default | Effect |
 |---|---|---|
@@ -114,7 +152,7 @@ run("in.mp4", targets=["9:16", "1:1"], transcribe=True)
 | `--motion-workers` | auto | motion saliency threads (CPU) |
 | `--no-gpu-video` | off | disable NVDEC/NVENC |
 
-Each video gets a job folder in `working/<video>/`. Steps whose outputs already exist are skipped, so re-rendering a new format only re-runs `render`. Use `--force` to start over.
+Each video gets its own folder, `fovea_data/<video name>/`. Steps whose outputs already exist are skipped, so re-rendering a new format only re-runs `render`. Use `--force` to start over.
 
 ## Model weights
 Weights are not stored in git. They're fetched into `weights/` with `python -m fovea download`, from your Hugging Face repo if `FOVEA_HF_REPO` is set (publish one with `scripts/upload_weights_to_hf.py`), otherwise from the official sources. See [`weights/README.md`](weights/README.md).

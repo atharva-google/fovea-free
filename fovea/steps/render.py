@@ -7,6 +7,12 @@
 
 Reads:  input/<video>, prep/*, visual/*
 Writes: framing/*.csv, outputs/<label>.mp4, debug/*.mp4 (optional)
+
+Optional framing check (``steps.story.framing_check``): Gemini is shown our focal point as a green
+line (``focus_preview``) and may replace it, per shot, with a fixed position (``focus_fixes``).
+
+Cutdowns (``run_cuts``, after ``run``): the same crop along the same camera path, but only for the
+pieces of a cut, each with its own sound          -> outputs/<label>_<seconds>s_<mode>.mp4
 """
 
 from __future__ import annotations
@@ -16,7 +22,7 @@ import subprocess
 import tempfile
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import cv2
 import numpy as np
@@ -25,22 +31,30 @@ import pandas as pd
 from ..config import PipelineConfig
 from ..framing import CropGeometry, OutputTarget, find_focal_points_rules, find_focal_points_viterbi, plan_camera
 from ..models.ocr import records_to_df
+from ..framing.subjects import busy_shots, mark_overlays
 from ..models.speakers import attach_speaking_scores
+from ..story.edit import decode_args, encode_args, frame_plan
 from ..utils.jobdir import JobDir
 from ..utils.progress import Counter, Progress, noop
-from ..utils.video import FFmpegFrameReader, VideoInfo, h264_encoder_args
+from ..utils.video import FFmpegFrameReader, VideoInfo, h264_encoder_args, hwaccel_args
 
 
-def run(job: JobDir, cfg: PipelineConfig, log=print, progress: Optional[Progress] = None) -> Dict[str, str]:
-    """Returns {format label: output path}, e.g. {"9x16": ".../outputs/9x16.mp4"}."""
-    progress = progress or noop
-    n_stages = 1 + len(cfg.targets)
-    progress("focal points", index=1, count=n_stages)
+def _focal(job: JobDir, cfg: PipelineConfig):
+    """Our own focal point per frame (in SOURCE pixels), from the detections alone."""
     src, proxy, _ = job.video_infos()
     shots = pd.read_csv(job.shots)
     data = merge_shards(job)
     tracks = attach_speaking_scores(data["tracks"], data["speaker_scores"])
-    ocr = records_to_df(data["ocr"])
+    # Before any crop centre is computed: text that sits in the same area in 2+ shots, on top of real picture,
+    # is an overlay (logo / disclaimer). It is marked (column "overlay") and the framing does not use it.
+    text = mark_overlays(data["ocr"], busy_shots(data["tracks"], float(proxy.width * proxy.height)))
+    ocr = records_to_df(text)
+    ocr.to_csv(job.framing_dir / "ocr.csv", index=False)                       # all text, with the mark
+    overlays = [r for r in text if r["overlay"]]
+    pd.DataFrame(overlays, columns=list(ocr.columns)).to_csv(job.framing_dir / "overlays.csv", index=False)
+    if overlays:
+        print(f"  {len(overlays)} text overlay(s) (logo / disclaimer) not used for framing: framing/overlays.csv",
+              flush=True)
 
     # Focal points are found in proxy pixels, then scaled to source pixels
     common = dict(shots_df=shots, shot_tracks=tracks, ocr_df=ocr, motion_results=data["motion"],
@@ -50,6 +64,93 @@ def run(job: JobDir, cfg: PipelineConfig, log=print, progress: Optional[Progress
     else:
         focal = find_focal_points_viterbi(**common, video_height=proxy.height)
     focal["target_cx"] = focal["target_cx"] * (src.width / proxy.width)
+    return focal, tracks, shots, data, src, proxy
+
+
+def apply_focus_fixes(focal: pd.DataFrame, fixes, fps: float, src_w: int) -> pd.DataFrame:
+    """Gemini's corrections on top of our focal points: in each ``(start_s, end_s, x percent)`` the
+    focal point is fixed at that position for the whole stretch (tag ``gemini_fixed``)."""
+    for start, end, x in fixes or []:
+        rows = (focal["frame_idx"] >= int(round(start * fps))) & (focal["frame_idx"] < int(round(end * fps)))
+        focal.loc[rows, "target_cx"] = x / 100.0 * src_w
+        focal.loc[rows, "tag"] = "gemini_fixed"
+        focal.loc[rows, "type"] = "gemini"
+    return focal
+
+
+def focus_line(job: JobDir, cfg: PipelineConfig):
+    """Where our software would centre the picture on every frame, for the first output format:
+    ``({frame: x in source pixels}, source info, proxy info)``."""
+    focal, _, _, _, src, proxy = _focal(job, cfg)
+    geom = CropGeometry.build(src.width, src.height, OutputTarget.parse(cfg.targets[0]), cfg.short_side)
+    traj = plan_camera(focal, geom, cfg.pan_window_frames, cfg.cut_threshold_px, cfg.still_deadband_px)
+    return dict(zip(traj["frame_idx"].astype(int).tolist(), traj["smoothed_cx"].tolist())), src, proxy
+
+
+def focus_preview(job: JobDir, centre: Dict[int, float], src: VideoInfo, proxy: VideoInfo, labels=(),
+                  log=print) -> Path:
+    """The video Gemini is shown for the framing check: the analysis copy with sound, a GREEN LINE where
+    our software would centre the picture, and the shot id in the top-left corner.
+
+    ``labels``: ``[(start_s, end_s, text)]``. Writes prep/focus_preview.mp4."""
+    k = proxy.width / float(src.width)
+    out = job.path("prep/focus_preview.mp4")
+    w, h = proxy.width, proxy.height
+    spans = [(int(round(a * proxy.fps)), int(round(b * proxy.fps)), str(text)) for a, b, text in labels]
+
+    with tempfile.TemporaryFile() as err:
+        encoder = subprocess.Popen(
+            ["ffmpeg", "-y", "-v", "error", "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{w}x{h}",
+             "-r", f"{proxy.fps}", "-i", "-", "-i", str(job.source), "-map", "0:v:0", "-map", "1:a:0?",
+             "-c:v", "libx264", "-preset", "veryfast", "-crf", "26", "-pix_fmt", "yuv420p",
+             "-c:a", "aac", "-b:a", "96k", "-shortest", "-movflags", "+faststart", str(out)],
+            stdin=subprocess.PIPE, stderr=err)
+        cap = cv2.VideoCapture(str(job.proxy))
+        try:
+            i, last = 0, int(src.width / 2 * k)
+            while True:
+                ok, frame = cap.read()
+                if not ok or frame is None:
+                    break
+                if i in centre:
+                    last = int(centre[i] * k)
+                cv2.line(frame, (last, 0), (last, h - 1), (0, 255, 0), 4)
+                text = next((s for a, b, s in spans if a <= i < b), "")
+                if text:
+                    cv2.rectangle(frame, (0, 0), (110, 44), (0, 0, 0), -1)
+                    cv2.putText(frame, text, (10, 32), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
+                encoder.stdin.write(frame.tobytes())
+                i += 1
+        except BrokenPipeError:
+            pass
+        finally:
+            cap.release()
+            if encoder.stdin and not encoder.stdin.closed:
+                try:
+                    encoder.stdin.close()
+                except BrokenPipeError:
+                    pass
+            rc = encoder.wait()
+        if rc != 0:
+            err.seek(0)
+            raise RuntimeError(f"Could not write the focus preview:\n{err.read().decode(errors='ignore')[-1500:]}")
+    log(f"  focus preview for Gemini: {out}")
+    return out
+
+
+def run(job: JobDir, cfg: PipelineConfig, log=print, progress: Optional[Progress] = None,
+        focus_fixes=None) -> Dict[str, str]:
+    """Returns {format label: output path}, e.g. {"9x16": ".../outputs/9x16.mp4"}.
+
+    ``focus_fixes``: Gemini's corrections to our focal points (``story.framing_check.focus_fixes``), if any."""
+    progress = progress or noop
+    n_stages = 1 + len(cfg.targets)
+    progress("focal points", index=1, count=n_stages)
+    focal, tracks, shots, data, src, proxy = _focal(job, cfg)
+    if focus_fixes:
+        focal = apply_focus_fixes(focal, focus_fixes, proxy.fps, src.width)
+        log(f"  Gemini corrected the focal point in {len(focus_fixes)} shot(s): "
+            + ", ".join(f"{a:.1f}-{b:.1f}s -> {x}%" for a, b, x in focus_fixes))
     focal.to_csv(job.framing_dir / "focal_points.csv", index=False)
 
     outputs: Dict[str, str] = {}
@@ -132,6 +233,108 @@ def render_reframed(source: str | Path, src: VideoInfo, trajectory_df: pd.DataFr
             reader.close()
             if encoder.stdin and not encoder.stdin.closed:
                 encoder.stdin.close()
+            rc = encoder.wait()
+        if rc != 0:
+            err.seek(0)
+            raise RuntimeError(f"FFmpeg encode failed:\n{err.read().decode(errors='ignore')[-2000:]}")
+    return output_path
+
+
+# =========================================================================== cutdowns
+def run_cuts(job: JobDir, cfg: PipelineConfig, cuts: Dict[str, Dict[str, Any]], log=print,
+             progress: Optional[Progress] = None) -> Dict[str, str]:
+    """Render every usable cut in every output format. Call after ``run`` (it wrote the camera paths).
+
+    ``cuts`` is what ``fovea.story.report.make_cuts`` returns: ``{"15s_synced": {"pieces", "stats"}}``.
+    Returns {label: output path}, e.g. {"9x16_15s_synced": ".../outputs/9x16_15s_synced.mp4"}.
+    A cut that fails is reported and skipped; the others are still rendered.
+    """
+    progress = progress or noop
+    src, proxy, has_audio = job.video_infos()
+    todo = [(name, c) for name, c in cuts.items() if c["pieces"] and c["stats"]["ok"] and not c.get("same_as")]
+    outputs: Dict[str, str] = {}
+    n_stages, stage = len(todo) * len(cfg.targets), 0
+    for spec in cfg.targets:
+        target = OutputTarget.parse(spec)
+        geom = CropGeometry.build(src.width, src.height, target, cfg.short_side)
+        traj = pd.read_csv(job.framing_dir / f"trajectory_{target.label}.csv")
+        for name, cut in todo:
+            stage += 1
+            label = f"{target.label}_{name}"
+            out = job.outputs_dir / f"{label}.mp4"
+            frames = sum(count for _, count, _ in frame_plan(cut["pieces"], src.fps, src.total_frames or 0))
+            counter = Counter(progress, f"encode {label}", frames, "frames", stage, n_stages)
+            t = time.time()
+            try:
+                render_pieces(job.source, src, traj, geom, cut["pieces"], out, analysis_fps=proxy.fps,
+                              use_gpu=cfg.use_gpu_video, has_audio=has_audio, on_frames=counter.add)
+            except Exception as e:  # noqa: BLE001 - one bad cut must not lose the others
+                log(f"  ✗ {label}: {e}")
+                continue
+            outputs[label] = str(out)
+            log(f"  {label}: {frames / src.fps:.1f}s in {len(cut['pieces'])} piece(s) ({time.time() - t:.1f}s) -> {out}")
+    return outputs
+
+
+def render_pieces(source: str | Path, src: VideoInfo, trajectory_df: pd.DataFrame, geometry: CropGeometry,
+                  pieces: List[Dict[str, Any]], output_path: str | Path, analysis_fps: float = 25.0,
+                  use_gpu: bool = True, has_audio: bool = True,
+                  on_frames: Optional[Callable[[int], None]] = None) -> Path:
+    """Write one cut: for every piece, its frames cropped along the camera path, with the piece's sound.
+
+    Each piece is ``{"video_start", "audio_start", "length"}`` in source seconds. Lengths are rounded
+    to whole source frames and the sound is cut to the same lengths (``fovea/story/edit.py``).
+    """
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fps = src.fps or analysis_fps
+    plan = frame_plan(pieces, fps, src.total_frames or 0)
+
+    frames = trajectory_df["frame_idx"].astype(int).to_numpy()
+    n = int(frames.max()) + 1 if len(frames) else 1
+    cx_lookup = np.full(n, geometry.src_w / 2.0)
+    cx_lookup[frames] = trajectory_df["smoothed_cx"].to_numpy(dtype=np.float64)
+    ratio = analysis_fps / fps
+    out_w, out_h = geometry.out_w, geometry.out_h
+    nbytes = src.width * src.height * 3
+
+    with tempfile.TemporaryFile() as err:
+        encoder = subprocess.Popen(
+            encode_args(source, out_w, out_h, fps, plan, output_path, h264_encoder_args(use_gpu), has_audio),
+            stdin=subprocess.PIPE, stderr=err)
+        try:
+            for first, count, _ in plan:
+                reader = subprocess.Popen(decode_args(source, first, count, fps, hwaccel_args(use_gpu, source)),
+                                          stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=nbytes * 4)
+                got, last = 0, None
+                try:
+                    while got < count:
+                        buf = reader.stdout.read(nbytes)
+                        if len(buf) < nbytes:
+                            break
+                        frame = np.frombuffer(buf, np.uint8).reshape(src.height, src.width, 3)
+                        x1, y1, x2, y2 = geometry.window(cx_lookup[min(int(round((first + got) * ratio)), n - 1)])
+                        last = cv2.resize(frame[y1:y2, x1:x2], (out_w, out_h), interpolation=cv2.INTER_LANCZOS4).tobytes()
+                        encoder.stdin.write(last)
+                        got += 1
+                finally:
+                    if reader.poll() is None:
+                        reader.kill()
+                    reader.wait()
+                if last is None:
+                    raise RuntimeError(f"could not read the source video at {first / fps:.2f}s")
+                for _ in range(count - got):   # the source ended a little early: hold the last frame, keep the length
+                    encoder.stdin.write(last)
+                if on_frames:
+                    on_frames(count)
+        except BrokenPipeError:
+            pass
+        finally:
+            if encoder.stdin and not encoder.stdin.closed:
+                try:
+                    encoder.stdin.close()
+                except BrokenPipeError:
+                    pass
             rc = encoder.wait()
         if rc != 0:
             err.seek(0)

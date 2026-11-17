@@ -16,6 +16,7 @@ from scipy import signal
 from scipy.interpolate import interp1d
 from scipy.io import wavfile
 
+from ..framing.subjects import speaking_frames
 from ..utils.video import ShotReader
 from .tracker import ShotTracks
 
@@ -182,19 +183,23 @@ def _padded_crop(img: np.ndarray, pad: int, value: int, y0: int, y1: int, x0: in
 
 def attach_speaking_scores(shot_tracks: ShotTracks, scored_tracks: List[Dict[str, Any]]) -> ShotTracks:
     """Mark each person detection with ``speaking`` (bool) and ``asd_score`` (float|None)."""
-    speech_lookup = {}
-    for trk in scored_tracks:
-        for f_idx, score in zip(trk["frames"], trk["scores"]):
-            val = float(score)
-            if val > 0.0:
-                speech_lookup[(trk["shot_id"], int(f_idx), trk["track_id"])] = round(val, 3)
+    # A raw TalkNet score above 0 on a single frame is not enough (see framing/subjects.py): the score must
+    # hold for a stretch, be the strongest face on screen, and not belong to a tiny background face.
+    face_area = {}
+    for s_id, frames_data in shot_tracks.items():
+        for f_idx, detections in frames_data.items():
+            for det in detections:
+                box = det.get("face_bbox")
+                if det.get("cname") == "person" and box is not None:
+                    face_area[(int(s_id), int(f_idx), det["track_id"])] = float((box[2] - box[0]) * (box[3] - box[1]))
+    speech_lookup = speaking_frames(scored_tracks, face_area)
 
     for s_id, frames_data in shot_tracks.items():
         for f_idx, detections in frames_data.items():
             for det in detections:
                 if det.get("cname") != "person":
                     continue
-                key = (s_id, int(f_idx), det["track_id"])
+                key = (int(s_id), int(f_idx), det["track_id"])
                 det["speaking"] = key in speech_lookup
                 det["asd_score"] = speech_lookup.get(key)
     return shot_tracks
