@@ -83,6 +83,9 @@ def _build_parser() -> argparse.ArgumentParser:
                    dest="edit_thinking",
                    help="gemini brain: how much Gemini may reason before answering call 2. Less is faster; "
                         "'default' lets the model decide (slowest). Default: low")
+    c.add_argument("--show-thinking", action="store_true",
+                   help="gemini brain: print a summary of what Gemini reasoned about in call 2 (a diagnostic; "
+                        "only when call 2 is actually asked, so use it with --refresh-edits)")
     c.add_argument("--refresh-edits", action="store_true",
                    help="gemini brain: ask call 2 again even if an edit is stored for this length and mode")
     c.add_argument("--cut-penalty", type=float, default=None, help="code brain: higher = fewer, longer pieces (default 3)")
@@ -199,7 +202,8 @@ def main(argv=None) -> None:
         debug_renders=args.debug_renders, force=args.force,
         cut_durations=args.cut_durations, cut_modes=args.cut_modes,
         cut_brain=args.cut_brain, refresh_edits=args.refresh_edits,
-        edit_thinking="" if args.edit_thinking == "default" else args.edit_thinking, gemini_framing=args.gemini_framing,
+        edit_thinking="" if args.edit_thinking == "default" else args.edit_thinking,
+        show_thinking=args.show_thinking, gemini_framing=args.gemini_framing,
         cut_params={k: v for k, v in (("cut_penalty", args.cut_penalty), ("arc_importance", args.arc_importance),
                                       ("use_hook", False if args.no_hook else None)) if v is not None},
     )

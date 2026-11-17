@@ -182,6 +182,15 @@ class ParseTest(unittest.TestCase):
                                                         "segments": [{"audio": hope, "video": ""}]})
         self.assertIn("story score: 4/10  LOW  the payoff has no setup", call2.report({"x": cut}))
 
+    def test_reasoning_parts_are_separated_from_the_answer(self):
+        from types import SimpleNamespace as NS
+        parts = [NS(thought=True, text="First I add up the lengths."), NS(thought=True, text="V04 is too short."),
+                 NS(thought=False, text='{"edits": '), NS(thought=None, text="[]}")]
+        resp = NS(candidates=[NS(content=NS(parts=parts))], text="ignored")
+        self.assertEqual(call2._split_thoughts(resp), ("First I add up the lengths.\n\nV04 is too short.", '{"edits": []}'))
+        self.assertEqual(call2._split_thoughts(NS(candidates=[], text='{"edits": []}')), ("", '{"edits": []}'))
+        self.assertEqual(call2._split_thoughts(NS(candidates=[NS(content=NS(parts=None))], text="{}")), ("", "{}"))
+
     def test_cutaway_segments_and_a_missing_edit(self):
         raw = {"edits": [{"target_s": 10, "segments": [{"audio": "A07", "video": "V03"}], "story": ""}]}
         got = call2.parse(raw, [10, 6], "cutaway")

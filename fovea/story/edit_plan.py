@@ -221,13 +221,17 @@ def _fill(template: str, described: Dict[str, Any], all_shots: List[VideoUnit], 
 def request(audio: List[AudioUnit], video: List[VideoUnit], described: Dict[str, Any], targets: Sequence[float],
             mode: str, api_key: str, model: str = "gemini-3.8-flash", api_version: str = "v1beta",
             log: Callable[[str], None] = print, talk: Sequence[Span] = (),
-            thinking: str = "") -> Dict[str, Dict[str, Any]]:
+            thinking: str = "", show_thinking: bool = False,
+            thoughts_dir: Optional[Path] = None) -> Dict[str, Dict[str, Any]]:
     """One text-only request for ``mode``. Returns ``{"15s_synced": {"target_s", "mode", "segments",
     "story", "model"}}`` with ``segments`` as ``[{"audio", "video"}]`` in both modes.
 
     ``thinking``: how much the model may reason before answering: "minimal", "low", "medium", "high",
     or "" for the model's own default (the slowest: it reasoned for minutes on this task). If the
-    model rejects the setting, the request is sent once more without it."""
+    model rejects the setting, the request is sent once more without it.
+
+    ``show_thinking``: also ask for a summary of the model's reasoning and print it (and write it to
+    ``thoughts_dir``/call2_thinking_<mode>.txt). A diagnostic: it does not change the edit asked for."""
     if mode not in MODES:
         raise ValueError(f"mode must be one of {MODES}")
     if not api_key:
@@ -249,13 +253,18 @@ def request(audio: List[AudioUnit], video: List[VideoUnit], described: Dict[str,
     client = genai.Client(api_key=api_key, http_options=types.HttpOptions(**http))
     base = dict(response_mime_type="application/json", response_schema=schema)
     limited = dict(base)
-    if thinking and hasattr(types, "ThinkingConfig"):
+    wanted: Dict[str, Any] = {}
+    if thinking:
+        wanted["thinking_level"] = thinking
+    if show_thinking:
+        wanted["include_thoughts"] = True
+    if wanted and hasattr(types, "ThinkingConfig"):
         try:
-            limited["thinking_config"] = types.ThinkingConfig(thinking_level=thinking)
-        except Exception:  # noqa: BLE001 - an older google-genai without thinking levels
-            log(f"  call 2 ({mode}): this google-genai version has no thinking levels; using the model's default")
+            limited["thinking_config"] = types.ThinkingConfig(**wanted)
+        except Exception:  # noqa: BLE001 - an older google-genai without these settings
+            log(f"  call 2 ({mode}): this google-genai version has no thinking settings; using the model's default")
     log(f"  call 2 ({mode}): asking {model} for {', '.join(f'{t:g}s' for t in targets)}"
-        f" (thinking: {thinking if 'thinking_config' in limited else 'model default'})")
+        f" (thinking: {thinking if thinking and 'thinking_config' in limited else 'model default'})")
     try:
         t0 = time.time()
         try:
@@ -272,7 +281,16 @@ def request(audio: List[AudioUnit], video: List[VideoUnit], described: Dict[str,
         log(f"  call 2 ({mode}) answered in {time.time() - t0:.1f}s | tokens in={getattr(usage, 'prompt_token_count', None)} "
             f"out={getattr(usage, 'candidates_token_count', None)} "
             f"thinking={getattr(usage, 'thoughts_token_count', None)}")
-        raw = json.loads(resp.text or "")
+        thoughts, answer = _split_thoughts(resp)
+        if show_thinking:
+            shown = thoughts or "(the model returned no summary of its reasoning)"
+            if thoughts_dir is not None:
+                try:
+                    Path(thoughts_dir, f"call2_thinking_{mode}.txt").write_text(shown)
+                except OSError:
+                    pass
+            log(f"\n----- call 2 ({mode}): what the model reasoned about -----\n{shown}\n----- end ({mode}) -----\n")
+        raw = json.loads(answer or "")
     except ValueError:
         raise GeminiError("Gemini's answer was not valid JSON (it may have been cut off); run the command again")
     except Exception as e:  # noqa: BLE001 - never leak the key
@@ -280,6 +298,18 @@ def request(audio: List[AudioUnit], video: List[VideoUnit], described: Dict[str,
             raise GeminiError(f"Gemini did not answer within {REQUEST_TIMEOUT_S}s; run the command again") from None
         raise GeminiError(f"Gemini call failed: {type(e).__name__}: {e}".replace(api_key, "***")) from None
     return parse(raw, targets, mode, model)
+
+
+def _split_thoughts(resp: Any) -> Tuple[str, str]:
+    """``(summary of the model's reasoning, its answer)`` from a response. Reasoning parts are marked
+    ``thought``; they are only present when asked for."""
+    try:
+        parts = resp.candidates[0].content.parts or []
+    except (AttributeError, IndexError, TypeError):
+        return "", getattr(resp, "text", "") or ""
+    thoughts = [p.text for p in parts if getattr(p, "thought", False) and getattr(p, "text", None)]
+    answer = [p.text for p in parts if not getattr(p, "thought", False) and getattr(p, "text", None)]
+    return "\n\n".join(thoughts).strip(), "".join(answer) or (getattr(resp, "text", "") or "")
 
 
 def parse(raw: Dict[str, Any], targets: Sequence[float], mode: str, model: str = "") -> Dict[str, Dict[str, Any]]:

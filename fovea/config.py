@@ -147,6 +147,7 @@ class PipelineConfig:
     gemini_framing: bool = False  # optional extra Gemini call: let it correct our focal point per shot
     cut_brain: str = "gemini"    # who builds the edit: "gemini" (two calls: describe, then edit) | "code" (story map + selector)
     edit_thinking: str = "low"   # call 2: how much Gemini may reason first: minimal | low | medium | high | "" (its default, slowest)
+    show_thinking: bool = False  # call 2: print a summary of what the model reasoned about (a diagnostic)
     refresh_edits: bool = False  # gemini brain: ask call 2 again even if an edit is stored for this length and mode
     cut_params: Dict[str, Any] = field(default_factory=dict)  # selector settings (fovea/story/select.py), e.g. {"cut_penalty": 1}
 
