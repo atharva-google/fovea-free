@@ -1,10 +1,11 @@
 """Call 1: Gemini watches the video ONCE and describes every unit. Stored; never repeated for a file.
 
-For each video unit (a shot): what is seen, the one thing the viewer must see, and which earlier units
-the shot depends on (a reaction needs what it reacts to). Call 1 is about the story and the units
+For the video: a cast list (who appears, how they look, their names if known).
+For each video unit (a shot): what is seen, which cast members are in it, the setting, the objects
+that matter, its on-screen text, and which earlier units it depends on. Call 1 is about the story and the units
 only; checking the framing is a separate, optional call (``framing_check.py``).
-For each audio unit: what is really heard (the transcript corrected), and which earlier units it
-depends on (a punchline needs its setup).
+For each audio unit: what is really heard (the transcript corrected), who says it, and which earlier
+units it depends on (a punchline needs its setup).
 
 One request, with an output schema (fovea/story/schemas.py), standard video processing.
 
@@ -22,7 +23,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .pieces import PIECES_VERSION, AudioUnit, VideoUnit
 
-CALL1_VERSION = 5           # bump when the prompt or schema changes in a way that makes stored answers stale
+CALL1_VERSION = 6           # bump when the prompt or schema changes in a way that makes stored answers stale
 REQUEST_TIMEOUT_S = 300
 PROCESSING_TIMEOUT_S = 180
 PIECES_FILE, CALL1_FILE = "pieces.json", "call1.json"
@@ -44,9 +45,16 @@ The measurements next to each unit come from analysis software and can be wrong:
 Trust what you see and hear over these.
 
 For EVERY video unit give:
-  shows    what is seen, in one sentence: who, doing what, where; include readable on-screen text and any
-           object that matters to the story (the product, the gift)
-  focus    the ONE thing the viewer must see in this shot, in a few words
+  shows    what is seen, in one sentence: who, doing what. People who are not in the cast list (a crowd,
+           passers-by) are mentioned here.
+  cast     the ids of the cast members (see "cast" below) recognisably visible at ANY point in this shot, even
+           briefly, partly or from behind
+  setting  where it is, as a short label ("living room", "beach", "studio, white background"). Use exactly the
+           same wording for every shot in the same place.
+  objects  things that matter to the story or that someone would name: the product, props that are handled,
+           vehicles, animals. A few words each, and the same wording in every shot they appear in.
+  text     readable on-screen text that belongs to THIS shot (a price, a caption, a sign, end-card wording),
+           corrected. Leave out a logo or disclaimer that sits in the same place throughout the video.
   needs    earlier units this shot makes no sense without (a reaction needs what it reacts to; a reveal needs
            its setup). Only the DIRECT ones, usually one or none; do not list the whole chain.
            Look hardest at the END of the video: a closing shot that calls back to an earlier moment (a joke, a
@@ -59,8 +67,18 @@ For EVERY audio unit give:
   needs    earlier units this sound makes no sense without (a punchline needs its setup line; "look at this"
            needs the shot it points at; a line that refers back to an earlier moment needs that moment).
            Only the DIRECT ones, usually one or none.
+  speaker  who says it: a cast id; "voiceover" for a narrator who is not in the cast; "other" for any other
+           unseen or unlisted voice; empty when nothing is spoken
 
 Also give:
+  cast     everyone who speaks or is clearly the subject of at least one shot, as P1, P2, ... in order of first
+           appearance. NOT background people or crowds. The same person is ONE entry however often they appear,
+           also if their clothes or the lighting change. For each:
+             real_name    their real name ONLY if this is a well-known person you recognise with confidence;
+                          otherwise empty. Never guess.
+             ad_name      the name the video itself gives them (spoken or on screen); otherwise empty
+             description  how they LOOK, so they can be told apart: apparent age and gender, hair, build,
+                          clothing. Nothing about what they do in the story.
   summary  one or two sentences: the story of the ad
   music    "bed" if continuous music runs under the ad, "none" if not, "only" if the file is nothing but music
 
@@ -106,6 +124,26 @@ def clean(raw: Dict[str, Any], audio: List[AudioUnit], video: List[VideoUnit]) -
     def by_id(items: Any) -> Dict[str, Dict[str, Any]]:
         return {str(x.get("id", "")).strip(): x for x in items or [] if isinstance(x, dict)}
 
+    def words(value: Any) -> List[str]:
+        out = []
+        for x in value or [] if isinstance(value, (list, tuple)) else []:
+            x = str(x).strip()
+            if x and x not in out:
+                out.append(x)
+        return out
+
+    cast = []
+    for c in raw.get("cast") or []:
+        if not isinstance(c, dict):
+            continue
+        cid = str(c.get("id") or "").strip()
+        if not cid or cid in {x["id"] for x in cast}:
+            issues.append(f"cast entry with a missing or repeated id {cid!r} ignored")
+            continue
+        cast.append({"id": cid, "real_name": str(c.get("real_name") or "").strip(),
+                     "ad_name": str(c.get("ad_name") or "").strip(), "description": str(c.get("description") or "").strip()})
+    cast_ids = {c["id"] for c in cast}
+
     got_v, got_a = by_id(raw.get("video_units")), by_id(raw.get("audio_units"))
     for uid in [*got_v, *got_a]:
         if uid not in start:
@@ -116,18 +154,33 @@ def clean(raw: Dict[str, Any], audio: List[AudioUnit], video: List[VideoUnit]) -
         if g is None:
             issues.append(f"{v.id} missing from the answer")
             g = {}
-        video_out.append({"id": v.id, "shows": str(g.get("shows") or ""), "focus": str(g.get("focus") or ""),
-                          "needs": needs(v.id, g.get("needs"))})
+        seen = words(g.get("cast"))
+        for c in seen:
+            if c not in cast_ids:
+                issues.append(f"{v.id} lists {c!r}, who is not in the cast: ignored")
+        video_out.append({"id": v.id, "shows": str(g.get("shows") or ""), "cast": [c for c in seen if c in cast_ids],
+                          "setting": str(g.get("setting") or "").strip(), "objects": words(g.get("objects")),
+                          "text": words(g.get("text")), "needs": needs(v.id, g.get("needs"))})
     for a in audio:
         g = got_a.get(a.id)
         if g is None:
             issues.append(f"{a.id} missing from the answer")
             g = {}
         heard = str(g.get("heard") or "") or (a.text if a.kind == "speech" else "(silence)")
-        audio_out.append({"id": a.id, "heard": heard, "needs": needs(a.id, g.get("needs"))})
+        speaker = str(g.get("speaker") or "").strip()
+        if speaker and speaker not in cast_ids and speaker not in ("voiceover", "other"):
+            issues.append(f"{a.id} is said by {speaker!r}, who is not in the cast: recorded as 'other'")
+            speaker = "other"
+        audio_out.append({"id": a.id, "heard": heard, "speaker": speaker, "needs": needs(a.id, g.get("needs"))})
     music = str(raw.get("music") or "none")
     return {"summary": str(raw.get("summary") or ""), "music": music if music in ("none", "bed", "only") else "none",
-            "video_units": video_out, "audio_units": audio_out}, issues
+            "cast": cast, "video_units": video_out, "audio_units": audio_out}, issues
+
+
+def cast_name(c: Dict[str, Any]) -> str:
+    """``P1 (Jigyasa / Alia Bhatt)``: the id with whatever names are known."""
+    names = " / ".join(n for n in (c.get("ad_name"), c.get("real_name")) if n)
+    return f"{c['id']} ({names})" if names else c["id"]
 
 
 # =========================================================================== the Gemini call
@@ -253,19 +306,26 @@ def _write(path: Path, data: Any) -> None:
 def report(audio: List[AudioUnit], video: List[VideoUnit], described: Dict[str, Any]) -> str:
     dv = {u["id"]: u for u in described["video_units"]}
     da = {u["id"]: u for u in described["audio_units"]}
-    lines = [f"SUMMARY: {described['summary']}", f"MUSIC: {described['music']}", "", "VIDEO UNITS (one per shot)"]
+    lines = [f"SUMMARY: {described['summary']}", f"MUSIC: {described['music']}", "", "CAST"]
+    lines += [f"  {cast_name(c)}: {c['description']}" for c in described.get("cast") or []] or ["  (nobody)"]
+    lines += ["", "VIDEO UNITS (one per shot)"]
     for v in video:
         d = dv[v.id]
         need = f"  needs {' '.join(d['needs'])}" if d["needs"] else ""
         lines.append(f"  {v.id}  {v.start:6.2f}-{v.end:6.2f}s {v.dur:5.2f}s  talking {v.talking:4.0%}{need}")
         lines.append(f"        shows: {d['shows']}")
-        lines.append(f"        focus: {d['focus']}")
+        lines.append(f"        cast: {' '.join(d.get('cast') or []) or '-'}  |  setting: {d.get('setting') or '-'}")
+        if d.get("objects"):
+            lines.append(f"        objects: {'; '.join(d['objects'])}")
+        if d.get("text"):
+            lines.append(f"        text: {'; '.join(d['text'])}")
     lines += ["", "AUDIO UNITS"]
     for a in audio:
         d = da[a.id]
         need = f"  needs {' '.join(d['needs'])}" if d["needs"] else ""
+        who = f"{d['speaker']}: " if d.get("speaker") else ""
         lines.append(f"  {a.id}  {a.start:6.2f}-{a.end:6.2f}s {a.dur:5.2f}s  over {' '.join(a.over):<8} "
-                     f"heard: {d['heard']}{need}")
+                     f"heard: {who}{d['heard']}{need}")
         if a.kind == "speech" and d["heard"].strip() != a.text.strip():
             lines.append(f"        (rough transcript was: {a.text})")
     return "\n".join(lines)

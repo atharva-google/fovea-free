@@ -35,12 +35,30 @@ class Music(str, Enum):
     only = "only"  # the file IS music (a supplied music track)
 
 
+class CastMember(BaseModel):
+    id: str = Field(description="P1, P2, ... in order of first appearance.")
+    real_name: str = Field(description="Their real name, ONLY if this is a well-known person you recognise with "
+                                       "confidence. Otherwise an empty string. Never guess.")
+    ad_name: str = Field(description="The name the video itself gives them (spoken, or written on screen). "
+                                     "Otherwise an empty string.")
+    description: str = Field(description="How they LOOK, so they can be told apart: apparent age and gender, hair, "
+                                         "build, clothing. Nothing about what they do in the story.")
+
+
 class VideoUnit(BaseModel):
     id: str = Field(description="Video unit id, e.g. V07. Every video unit appears exactly once.")
-    shows: str = Field(description="What is SEEN, in one sentence, including readable on-screen text and any "
-                                   "object that matters (the product, the gift).")
-    focus: str = Field(description="The ONE thing the viewer must see in this unit, in a few words "
-                                   "('her face', 'the sweater', 'the price tag').")
+    shows: str = Field(description="What is SEEN, in one sentence: who, doing what. People who are not in the cast "
+                                   "list (a crowd, passers-by) are mentioned here.")
+    cast: List[str] = Field(description="Ids of the cast members recognisably visible at ANY point in this shot, "
+                                        "even briefly, partly or from behind. Empty if none.")
+    setting: str = Field(description="Where it is, as a short label ('living room', 'beach', 'studio, white "
+                                     "background'). Use exactly the same wording for every shot in the same place.")
+    objects: List[str] = Field(description="Things that matter to the story or that someone would name: the product, "
+                                           "props that are handled, vehicles, animals. A few words each, the same "
+                                           "wording in every shot they appear in. Empty if none.")
+    text: List[str] = Field(description="Readable on-screen text that belongs to THIS shot (a price, a caption, a "
+                                        "sign, end-card wording), corrected. Leave out a logo or disclaimer that "
+                                        "sits in the same place throughout the video. Empty if none.")
     needs: List[str] = Field(description="EARLIER units (video or audio ids) this shot makes no sense without: a "
                                          "reaction needs what it reacts to; a reveal needs its setup. Only the "
                                          "DIRECT ones, usually one or none. Empty if the shot stands alone.")
@@ -51,6 +69,9 @@ class AudioUnit(BaseModel):
     heard: str = Field(description="What is REALLY heard. Speech written out and corrected from the rough "
                                    "transcript (fix wrong words, add what it missed, leave out what it invented). "
                                    "Other sounds in round brackets: '(aaa)', '(door slams)', '(music)', '(silence)'.")
+    speaker: str = Field(description="Who says it: a cast id (P1, ...), 'voiceover' for a narrator who is not in the "
+                                     "cast, 'other' for any other unseen or unlisted voice, or an empty string when "
+                                     "nothing is spoken.")
     needs: List[str] = Field(description="EARLIER units (audio or video ids) this sound makes no sense without: a "
                                          "punchline needs its setup line; 'look at this' needs the shot it points "
                                          "at. Only the DIRECT ones, usually one or none. Empty if it stands alone.")
@@ -59,6 +80,8 @@ class AudioUnit(BaseModel):
 class Units(BaseModel):
     summary: str = Field(description="One or two sentences: what this file is and the story it tells.")
     music: Music
+    cast: List[CastMember] = Field(description="Everyone who speaks or is clearly the subject of at least one shot. "
+                                               "Not background people or crowds.")
     video_units: List[VideoUnit] = Field(description="Empty for an audio-only file.")
     audio_units: List[AudioUnit]
 

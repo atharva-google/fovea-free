@@ -42,19 +42,19 @@ class PromptTest(unittest.TestCase):
         self.assertNotIn("{", text.split("SHOTS (what is seen)")[0])           # every placeholder was filled
         self.assertIn("each of these lengths: 15s, 10s".lower(), text.lower())
         self.assertIn("Full length: 11.0s", text)
-        self.assertIn("V02 | 4.00s | shows: her face falls as she opens it | needs V01", text)
-        self.assertIn(f"S{sweater[1:]} | 1.11s | over V02 | heard: A sweater. | needs S{hope[1:]}", text)
+        self.assertIn("V02 | 4.00s | cast: P1 | shows: her face falls as she opens it | needs V01", text)
+        self.assertIn(f"S{sweater[1:]} | 1.11s | over V02 | heard: P1: A sweater. | needs S{hope[1:]}", text)
         self.assertNotIn(f"{sweater} |", text)                                  # no audio ids in the synced prompt
 
     def test_cutaway_prompt_gives_the_two_tracks_separately(self):
         audio, video, described, hope, sweater = setup()
         text = call2.cutaway_prompt(audio, video, described, [10], TALK)
-        self.assertIn("V03 | 3.00s | CAN COVER up to 3.0s | shows: a red sweater in the box; tag reads 'For you' | "
-                      f"focus: the sweater | needs {sweater}", text)
+        self.assertIn(f"V03 | 3.00s | CAN COVER up to 3.0s | shows: a red sweater in the box | needs {sweater}", text)
+        self.assertIn("P1 (Mira): woman, about 30, red kurta", text)
         self.assertIn("V01 | 4.00s | CAN COVER up to 1.3s |", text)             # only her silent reaction
         busy = call2.cutaway_prompt(audio, video, described, [10], [(0.0, 3.5)])
         self.assertIn("V01 | 4.00s | cannot cover (a face is talking) |", busy)
-        self.assertIn(f"{sweater} | 1.11s | own picture V02 | heard: A sweater. | needs {hope}", text)
+        self.assertIn(f"{sweater} | 1.11s | own picture V02 | heard: P1: A sweater. | needs {hope}", text)
 
 
 # The case from a real ad: a closing voiceover runs, without a pause, over the last two shots.

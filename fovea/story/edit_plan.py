@@ -23,11 +23,11 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
-from .describe import REQUEST_TIMEOUT_S, GeminiError
+from .describe import REQUEST_TIMEOUT_S, GeminiError, cast_name
 from .pieces import AudioUnit, VideoUnit
 from .select import Piece, merge_pieces
 
-CALL2_VERSION = 5
+CALL2_VERSION = 6
 CALL2_FILE = "call2.json"
 MIN_COVER = 0.8      # a cover picture shorter than this is not worth a cut
 MODES = ("synced", "cutaway")
@@ -38,6 +38,8 @@ _COMMON = """You are a senior video editor cutting an ad down to shorter version
 You cannot see the video. Another editor watched it and logged every piece of it for you (below).
 
 THE AD: {summary}
+CAST (who is who; "voiceover" is a narrator who is never seen)
+{cast}
 Continuous background music: {music}
 Full length: {source:.1f}s. Make one edit for EACH of these lengths: {targets}.
 
@@ -128,13 +130,21 @@ def _needs(ids: Sequence[str], as_segments: bool) -> str:
     return f" | needs {' '.join(ids)}" if ids else ""
 
 
+def _cast(shot: Dict[str, Any]) -> str:
+    return f" | cast: {' '.join(shot['cast'])}" if shot.get("cast") else ""
+
+
+def _said(sound: Dict[str, Any]) -> str:
+    return f"{sound['speaker']}: {sound['heard']}" if sound.get("speaker") else sound["heard"]
+
+
 def synced_prompt(audio: List[AudioUnit], video: List[VideoUnit], described: Dict[str, Any],
                   targets: Sequence[float]) -> str:
     dv = {u["id"]: u for u in described["video_units"]}
     da = {u["id"]: u for u in described["audio_units"]}
-    shots = "\n".join(f"{v.id} | {v.dur:.2f}s | shows: {dv[v.id]['shows']}{_needs(dv[v.id]['needs'], True)}"
-                      for v in video)
-    segs = "\n".join(f"{_sid(a.id)} | {a.dur:.2f}s | over {' '.join(a.over)} | heard: {da[a.id]['heard']}"
+    shots = "\n".join(f"{v.id} | {v.dur:.2f}s{_cast(dv[v.id])} | shows: {dv[v.id]['shows']}"
+                      f"{_needs(dv[v.id]['needs'], True)}" for v in video)
+    segs = "\n".join(f"{_sid(a.id)} | {a.dur:.2f}s | over {' '.join(a.over)} | heard: {_said(da[a.id])}"
                      f"{_needs(da[a.id]['needs'], True)}" for a in audio)
     return _fill(SYNCED_PROMPT, described, video, targets, shots=shots, segments=segs)
 
@@ -155,11 +165,11 @@ def cutaway_prompt(audio: List[AudioUnit], video: List[VideoUnit], described: Di
         room = cover_room(v, talk)
         return f"CAN COVER up to {room:.1f}s" if room else "cannot cover (a face is talking)"
 
-    vid = "\n".join(f"{v.id} | {v.dur:.2f}s | {can_cover(v)} | shows: {dv[v.id]['shows']} | "
-                    f"focus: {dv[v.id]['focus']}{_needs(dv[v.id]['needs'], False)}" for v in video)
+    vid = "\n".join(f"{v.id} | {v.dur:.2f}s | {can_cover(v)}{_cast(dv[v.id])} | shows: {dv[v.id]['shows']}"
+                    f"{_needs(dv[v.id]['needs'], False)}" for v in video)
     lines = []
     for s in make_slots(audio, video):
-        heard = da[s["audio"]]["heard"] if s["part"] == 0 else "(the same sound continues)"
+        heard = _said(da[s["audio"]]) if s["part"] == 0 else "(the same sound continues)"
         needs = _needs(da[s["audio"]]["needs"], False) if s["part"] == 0 else ""
         lines.append(f"{s['id']} | {s['end'] - s['start']:.2f}s | own picture {s['shot']} | heard: {heard}{needs}")
     return _fill(CUTAWAY_PROMPT, described, video, targets, video=vid, audio="\n".join(lines))
@@ -191,7 +201,8 @@ def make_slots(audio: List[AudioUnit], video: List[VideoUnit], min_part: float =
 def _fill(template: str, described: Dict[str, Any], all_shots: List[VideoUnit], targets: Sequence[float], **tables) -> str:
     music = {"bed": "yes", "only": "yes"}.get(described.get("music"), "no")
     out = template
-    for key, value in {"summary": described.get("summary", ""), "music": music,
+    cast = "\n".join(f"{cast_name(c)}: {c['description']}" for c in described.get("cast") or []) or "(nobody)"
+    for key, value in {"summary": described.get("summary", ""), "music": music, "cast": cast,
                        "source": f"{all_shots[-1].end:.1f}", "targets": ", ".join(f"{t:g}s" for t in targets),
                        **tables}.items():
         out = out.replace("{" + key + "}", str(value)).replace("{" + key + ":.1f}", str(value))

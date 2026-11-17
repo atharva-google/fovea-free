@@ -25,14 +25,18 @@ def answer(audio, video):
     pause = audio[audio.index(line) - 1]
     return {
         "summary": "She hopes for shoes and gets a sweater.", "music": "bed",
+        "cast": [{"id": "P1", "real_name": "", "ad_name": "Mira", "description": "woman, about 30, red kurta"}],
         "video_units": [
-            {"id": "V01", "shows": "a woman walks in with a gift", "focus": "her face", "needs": []},
-            {"id": "V02", "shows": "her face falls as she opens it", "focus": "her face", "needs": ["V01"]},
-            {"id": "V03", "shows": "a red sweater in the box; tag reads 'For you'", "focus": "the sweater",
-             "needs": [line.id]},
+            {"id": "V01", "shows": "a woman walks in with a gift", "cast": ["P1"], "setting": "living room",
+             "objects": ["gift box"], "text": [], "needs": []},
+            {"id": "V02", "shows": "her face falls as she opens it", "cast": ["P1"], "setting": "living room",
+             "objects": ["gift box"], "text": [], "needs": ["V01"]},
+            {"id": "V03", "shows": "a red sweater in the box", "cast": [], "setting": "living room",
+             "objects": ["sweater", "gift box"], "text": ["For you"], "needs": [line.id]},
         ],
         "audio_units": [{"id": a.id, "heard": {line.id: "A sweater.", pause.id: "(aaa)"}.get(a.id, a.text or "(silence)"),
-                         "needs": [setup.id] if a.id == line.id else []} for a in audio],
+                         "speaker": "P1" if a.text else "", "needs": [setup.id] if a.id == line.id else []}
+                        for a in audio],
     }
 
 
@@ -74,7 +78,8 @@ class Call1Test(unittest.TestCase):
         raw["music"] = "loud"
         described, issues = call1.clean(raw, audio, video)
         self.assertEqual([u["id"] for u in described["video_units"]], ["V01", "V02", "V03"])
-        self.assertEqual(described["video_units"][2], {"id": "V03", "shows": "", "focus": "", "needs": []})
+        self.assertEqual(described["video_units"][2], {"id": "V03", "shows": "", "cast": [], "setting": "",
+                                                       "objects": [], "text": [], "needs": []})
         line = next(a for a in audio if a.text == "A sweater.")
         got = next(u for u in described["audio_units"] if u["id"] == line.id)
         self.assertEqual(got["heard"], "A sweater.")                           # falls back to the rough transcript
@@ -101,14 +106,36 @@ class Call1Test(unittest.TestCase):
         self.assertNotIn("GREEN", text)
         self.assertNotIn("focus_x", text)
         described, _ = call1.clean(answer(audio, video), audio, video)
-        self.assertEqual(sorted(described["video_units"][0]), ["focus", "id", "needs", "shows"])
+        self.assertEqual(sorted(described["video_units"][0]), ["cast", "id", "needs", "objects", "setting", "shows", "text"])
+        self.assertNotIn("focus", text.split("VIDEO UNITS")[0].replace("in focus", ""))
+
+    def test_cast_and_speakers_are_checked_against_the_cast_list(self):
+        audio, video = pieces()
+        raw = answer(audio, video)
+        raw["cast"].append({"id": "P1", "description": "a duplicate"})
+        raw["cast"].append({"id": "P2", "real_name": " Someone Famous ", "ad_name": "", "description": "man, grey beard"})
+        raw["video_units"][0]["cast"] = ["P1", "P9", "P1"]
+        raw["audio_units"][1]["speaker"] = "P9"
+        raw["audio_units"][2]["speaker"] = "voiceover"
+        described, issues = call1.clean(raw, audio, video)
+        self.assertEqual([c["id"] for c in described["cast"]], ["P1", "P2"])
+        self.assertEqual(described["cast"][1]["real_name"], "Someone Famous")
+        self.assertEqual(described["video_units"][0]["cast"], ["P1"])
+        self.assertEqual([u["speaker"] for u in described["audio_units"][:3]], ["", "other", "voiceover"])
+        self.assertEqual(len(issues), 3)
+        self.assertEqual(call1.cast_name(described["cast"][0]), "P1 (Mira)")
+        self.assertEqual(call1.cast_name(described["cast"][1]), "P2 (Someone Famous)")
 
     def test_the_report_shows_what_gemini_saw_heard_and_linked(self):
         audio, video = pieces()
         described, _ = call1.clean(answer(audio, video), audio, video)
         text = call1.report(audio, video, described)
         self.assertIn("shows: her face falls as she opens it", text)
-        self.assertIn("focus: the sweater", text)
+        self.assertIn("P1 (Mira): woman, about 30, red kurta", text)
+        self.assertIn("cast: P1  |  setting: living room", text)
+        self.assertIn("objects: sweater; gift box", text)
+        self.assertIn("text: For you", text)
+        self.assertIn("heard: P1: A sweater.", text)
         self.assertIn("heard: (aaa)", text)
         self.assertIn("needs V01", text)
         json.dumps(described)
