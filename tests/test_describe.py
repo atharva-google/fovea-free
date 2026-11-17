@@ -100,6 +100,12 @@ class Call1Test(unittest.TestCase):
             (prep / "call1.json").write_text("{broken")
             self.assertIsNone(call1.load(prep, "abc"))
 
+    def test_needs_is_about_meaning_not_about_what_comes_next(self):
+        audio, video = pieces()
+        text = call1.prompt(audio, video)
+        self.assertIn("does NOT need another one just because it comes after it", text)
+        self.assertIn("the parts of one sentence\n           do not need each other", text)
+
     def test_call_1_is_about_the_story_only_no_framing(self):
         audio, video = pieces()
         text = call1.prompt(audio, video)

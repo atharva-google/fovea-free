@@ -60,8 +60,9 @@ class VideoUnit(BaseModel):
                                         "sign, end-card wording), corrected. Leave out a logo or disclaimer that "
                                         "sits in the same place throughout the video. Empty if none.")
     needs: List[str] = Field(description="EARLIER units (video or audio ids) this shot makes no sense without: a "
-                                         "reaction needs what it reacts to; a reveal needs its setup. Only the "
-                                         "DIRECT ones, usually one or none. Empty if the shot stands alone.")
+                                         "reaction needs what it reacts to; a reveal needs its setup. NOT a shot "
+                                         "that merely comes before it or shows the same scene. Only the DIRECT "
+                                         "ones; most shots need nothing. Empty if the shot stands alone.")
 
 
 class AudioUnit(BaseModel):
@@ -74,7 +75,8 @@ class AudioUnit(BaseModel):
                                      "nothing is spoken.")
     needs: List[str] = Field(description="EARLIER units (audio or video ids) this sound makes no sense without: a "
                                          "punchline needs its setup line; 'look at this' needs the shot it points "
-                                         "at. Only the DIRECT ones, usually one or none. Empty if it stands alone.")
+                                         "at. NOT the sound that merely comes before it, and not another part of "
+                                         "the same sentence. Only the DIRECT ones; most sounds need nothing.")
 
 
 class Units(BaseModel):
@@ -110,6 +112,9 @@ class SyncedEdit(BaseModel):
     segments: List[str] = Field(description="Segment ids (S01, S02, ...) to keep, in playing order. "
                                             "Segments not listed are cut.")
     story: str = Field(description="One or two sentences: how the story holds, and what was cut to get here.")
+    story_score: int = Field(description="0-10: how well this edit works as a story for someone who never saw the "
+                                         "full ad. Be honest; a low score is useful.")
+    score_reason: str = Field(description="One or two sentences: what holds, and what is weak or missing.")
 
 
 class SyncedEdits(BaseModel):
@@ -126,6 +131,9 @@ class CutawayEdit(BaseModel):
     target_s: float = Field(description="The length that was asked for.")
     segments: List[CutawaySegment] = Field(description="In playing order. Sound slots not listed are cut.")
     story: str = Field(description="One or two sentences: how the story holds, and what was cut to get here.")
+    story_score: int = Field(description="0-10: how well this edit works as a story for someone who never saw the "
+                                         "full ad. Be honest; a low score is useful.")
+    score_reason: str = Field(description="One or two sentences: what holds, and what is weak or missing.")
 
 
 class CutawayEdits(BaseModel):

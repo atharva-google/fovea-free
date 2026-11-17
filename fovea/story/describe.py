@@ -23,7 +23,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .pieces import PIECES_VERSION, AudioUnit, VideoUnit
 
-CALL1_VERSION = 6           # bump when the prompt or schema changes in a way that makes stored answers stale
+CALL1_VERSION = 7           # bump when the prompt or schema changes in a way that makes stored answers stale
 REQUEST_TIMEOUT_S = 300
 PROCESSING_TIMEOUT_S = 180
 PIECES_FILE, CALL1_FILE = "pieces.json", "call1.json"
@@ -55,8 +55,10 @@ For EVERY video unit give:
            vehicles, animals. A few words each, and the same wording in every shot they appear in.
   text     readable on-screen text that belongs to THIS shot (a price, a caption, a sign, end-card wording),
            corrected. Leave out a logo or disclaimer that sits in the same place throughout the video.
-  needs    earlier units this shot makes no sense without (a reaction needs what it reacts to; a reveal needs
-           its setup). Only the DIRECT ones, usually one or none; do not list the whole chain.
+  needs    earlier units this shot makes NO SENSE without (a reaction needs what it reacts to; a reveal needs
+           its setup). A shot does NOT need another one just because it comes after it, shows the same scene or
+           continues the same action: ask "if the earlier unit were cut, would a viewer be confused by this
+           shot?" Most shots need nothing. Only the DIRECT ones; do not list the whole chain.
            Look hardest at the END of the video: a closing shot that calls back to an earlier moment (a joke, a
            claim, a demonstration), shows its result, or repeats it, needs that moment. If the earlier moment
            were cut, would this shot still make sense? If not, it needs it.
@@ -64,9 +66,10 @@ For EVERY video unit give:
 For EVERY audio unit give:
   heard    what is REALLY heard. Write speech out exactly, in its own language and script, correcting the rough
            transcript. Put any other sound in round brackets: (aaa), (laughs), (door slams), (music), (silence).
-  needs    earlier units this sound makes no sense without (a punchline needs its setup line; "look at this"
+  needs    earlier units this sound makes NO SENSE without (a punchline needs its setup line; "look at this"
            needs the shot it points at; a line that refers back to an earlier moment needs that moment).
-           Only the DIRECT ones, usually one or none.
+           A sound does NOT need the one before it just because it follows it, and the parts of one sentence
+           do not need each other. Most sounds need nothing. Only the DIRECT ones.
   speaker  who says it: a cast id; "voiceover" for a narrator who is not in the cast; "other" for any other
            unseen or unlisted voice; empty when nothing is spoken
 

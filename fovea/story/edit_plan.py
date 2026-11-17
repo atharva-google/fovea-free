@@ -27,9 +27,11 @@ from .describe import REQUEST_TIMEOUT_S, GeminiError, cast_name
 from .pieces import AudioUnit, VideoUnit
 from .select import Piece, merge_pieces
 
-CALL2_VERSION = 6
+CALL2_VERSION = 7
 CALL2_FILE = "call2.json"
-MIN_COVER = 0.8      # a cover picture shorter than this is not worth a cut
+MIN_COVER = 0.5      # a longer sound may be PARTLY covered only if at least this much picture is shown
+LOW_SCORE = 5        # Gemini's own story score at or below this is flagged
+SHORTEST_COVER = 0.4 # a stretch of picture shorter than this cannot cover anything
 MODES = ("synced", "cutaway")
 
 Span = Tuple[float, float]
@@ -61,6 +63,8 @@ How to edit:
   a demonstration), also cut (or do not choose) the pieces that call back to it, and end on something the kept
   story has earned.
 - Refer to pieces ONLY by their id. Never write timestamps.
+- Score each edit honestly: story_score from 0 to 10 for how well it works as a story for someone who never saw
+  the full ad, and score_reason saying what holds and what is weak or missing. A low score is useful information.
 """
 
 SYNCED_PROMPT = _COMMON + """
@@ -93,8 +97,9 @@ from a synced edit; build it this way:
   1. Choose the SOUNDS that tell the story (the lines that must be heard).
   2. Choose the SHOTS that must be seen (the product, the reveal, the result, the closing card).
   3. Lay those shots over the chosen sounds. Good sounds to cover: voiceover and narration (nobody is seen saying
-     it), a line by someone we have already seen, music or silence. Only shots marked "CAN COVER" may be used,
-     and only for a slot no longer than the seconds given there; any other choice is thrown away.
+     it), a line by someone we have already seen, music or silence. Only shots marked "CAN COVER" may be used.
+     Best is a slot no longer than the seconds given there. If the slot is longer, the cover is shown first, for
+     its seconds, and the rest of the sound plays over its own picture.
 
 The one rule that makes or breaks a cutaway: EVERY SECOND OF A SHOT CAN BE SHOWN ONLY ONCE.
 - If you show a shot over one sound, then any slot you keep whose OWN picture is that same shot can no longer
@@ -105,7 +110,8 @@ The one rule that makes or breaks a cutaway: EVERY SECOND OF A SHOT CAN BE SHOWN
 - A shot may cover several slots; it keeps playing from where it left off, up to its "CAN COVER" seconds in total.
 
 Also:
-- A shot marked "cannot cover" shows someone talking; another sound over it looks wrong. Never cut away to it.
+- A shot marked "cannot cover" either shows someone talking (another sound over it looks wrong) or is too short
+  to be worth a cut. Never cut away to it.
 - A sound that belongs to what is seen, like (door slams), stays with its own picture.
 - Do not cover a line when seeing the person say it is the point (a punchline delivered to camera).
 
@@ -151,9 +157,9 @@ def synced_prompt(audio: List[AudioUnit], video: List[VideoUnit], described: Dic
 
 def cover_room(v: VideoUnit, talk: Sequence[Span]) -> float:
     """Seconds of this shot usable as a cover in one go: its longest stretch without a talking face
-    (0 if that is too short to be worth a cut)."""
+    (0 if that is under ``SHORTEST_COVER``). A short shot can cover a sound that is no longer than it."""
     longest = max((b - a for a, b in quiet_spans(v, talk)), default=0.0)
-    return longest if longest >= MIN_COVER else 0.0
+    return longest if longest >= SHORTEST_COVER else 0.0
 
 
 def cutaway_prompt(audio: List[AudioUnit], video: List[VideoUnit], described: Dict[str, Any],
@@ -163,7 +169,9 @@ def cutaway_prompt(audio: List[AudioUnit], video: List[VideoUnit], described: Di
 
     def can_cover(v: VideoUnit) -> str:
         room = cover_room(v, talk)
-        return f"CAN COVER up to {room:.1f}s" if room else "cannot cover (a face is talking)"
+        if room:
+            return f"CAN COVER up to {room:.1f}s"
+        return "cannot cover (too short)" if v.dur < SHORTEST_COVER else "cannot cover (a face is talking)"
 
     vid = "\n".join(f"{v.id} | {v.dur:.2f}s | {can_cover(v)}{_cast(dv[v.id])} | shows: {dv[v.id]['shows']}"
                     f"{_needs(dv[v.id]['needs'], False)}" for v in video)
@@ -292,8 +300,13 @@ def parse(raw: Dict[str, Any], targets: Sequence[float], mode: str, model: str =
         else:
             segs = [{"audio": str(s.get("audio") or "").strip(), "video": str(s.get("video") or "").strip()}
                     for s in e.get("segments") or [] if isinstance(s, dict)]
+        try:
+            score = max(0, min(10, int(round(float(e.get("story_score"))))))
+        except (TypeError, ValueError):
+            score = None
         out[name(t, mode)] = {"target_s": float(t), "mode": mode, "segments": segs,
-                              "story": str(e.get("story") or ""), "model": model}
+                              "story": str(e.get("story") or ""), "story_score": score,
+                              "score_reason": str(e.get("score_reason") or ""), "model": model}
     return out
 
 
@@ -390,10 +403,10 @@ def build_cut(audio: List[AudioUnit], video: List[VideoUnit], described: Dict[st
     dv = {u["id"]: u for u in described["video_units"]}
     da = {u["id"]: u for u in described["audio_units"]}
 
-    def allocate() -> List[Optional[Tuple[float, float, float]]]:
-        """Per segment with a cover: (picture start, cover length, seconds of its own picture first)."""
+    def allocate(tails: Sequence[Span] = ()) -> List[Optional[Tuple[float, float, float]]]:
+        """Per segment with a cover: (picture start, cover length, seconds of its own picture AFTER the cover)."""
         cursor = {v.id: v.start for v in video}
-        own = [(S[i]["start"], S[i]["end"]) for i, vid in segs if not vid]      # footage shown with its own sound
+        own = [(S[i]["start"], S[i]["end"]) for i, vid in segs if not vid] + list(tails)   # footage shown with its own sound
         free = {v.id: _minus(quiet[v.id], own) for v in video}
         out: List[Optional[Tuple[float, float, float]]] = []
         for i, vid in segs:
@@ -421,8 +434,22 @@ def build_cut(audio: List[AudioUnit], video: List[VideoUnit], described: Dict[st
             out.append((start, length, max(0.0, need - length)))
         return out
 
+    def settle() -> List[Optional[Tuple[float, float, float]]]:
+        """A cover shorter than its sound leaves the end of the sound on its own picture. That footage is
+        then shown too, so no other cover may take it: allocate again until that holds."""
+        tails: List[Span] = []
+        plan = allocate(tails)
+        for _ in range(4):
+            now = sorted((S[i]["end"] - w[2], S[i]["end"]) for (i, vid), w in zip(segs, plan)
+                         if vid and w is not None and w[2] > 1e-3)
+            if now == tails:
+                break
+            tails = now
+            plan = allocate(tails)
+        return plan
+
     while True:                                   # undo covers that cannot work, until nothing changes
-        plan = allocate()
+        plan = settle()
         bad = next((k for k, (i, vid) in enumerate(segs) if vid and plan[k] is None), None)
         if bad is None:
             break
@@ -442,10 +469,10 @@ def build_cut(audio: List[AudioUnit], video: List[VideoUnit], described: Dict[st
         if not vid:
             pieces.append(Piece(s["start"], s["start"], dur, i, da[s["audio"]]["heard"][:60]))
             continue
-        start, length, own = win
+        start, length, own = win           # the cover first (seen as the line starts), then the sound's own picture
+        pieces.append(Piece(start, s["start"], length, f"{i}<-{vid}", f"over: {dv[vid]['shows']}"[:80]))
         if own > 1e-3:
-            pieces.append(Piece(s["start"], s["start"], own, i, "its own picture first"))
-        pieces.append(Piece(start, s["start"] + own, length, f"{i}<-{vid}", f"over: {dv[vid]['shows']}"[:80]))
+            pieces.append(Piece(s["start"] + length, s["start"] + length, own, i, "then its own picture"))
     pieces = merge_pieces(pieces, bridge_gap=1e-3)
 
     kept = set(order)
@@ -467,7 +494,8 @@ def build_cut(audio: List[AudioUnit], video: List[VideoUnit], described: Dict[st
     return {"pieces": [p.to_dict() for p in pieces],
             "stats": {"target": target, "mode": mode, "total": total, "units": [i for i, _ in segs],
                       "covers": {i: vid for i, vid in segs if vid}, "notes": notes, "ok": ok,
-                      "story": edit.get("story", "")}}
+                      "story": edit.get("story", ""), "story_score": edit.get("story_score"),
+                      "score_reason": edit.get("score_reason", "")}}
 
 
 def report(cuts: Dict[str, Dict[str, Any]]) -> str:
@@ -478,6 +506,9 @@ def report(cuts: Dict[str, Dict[str, Any]]) -> str:
         lines.append(f"=== {cut_name}: {st['total']:g}s in {len(cut['pieces'])} piece(s){flag}")
         if st.get("story"):
             lines.append(f"   Gemini: {st['story']}")
+        if st.get("story_score") is not None:
+            low = "  LOW" if st["story_score"] <= LOW_SCORE else ""
+            lines.append(f"   story score: {st['story_score']}/10{low}  {st.get('score_reason', '')}".rstrip())
         for n in st["notes"]:
             lines.append(f"   note: {n}")
         for p in cut["pieces"]:

@@ -51,10 +51,52 @@ class PromptTest(unittest.TestCase):
         text = call2.cutaway_prompt(audio, video, described, [10], TALK)
         self.assertIn(f"V03 | 3.00s | CAN COVER up to 3.0s | shows: a red sweater in the box | needs {sweater}", text)
         self.assertIn("P1 (Mira): woman, about 30, red kurta", text)
-        self.assertIn("V01 | 4.00s | CAN COVER up to 1.3s |", text)             # only her silent reaction
-        busy = call2.cutaway_prompt(audio, video, described, [10], [(0.0, 3.5)])
-        self.assertIn("V01 | 4.00s | cannot cover (a face is talking) |", busy)
         self.assertIn(f"{sweater} | 1.11s | own picture V02 | heard: P1: A sweater. | needs {hope}", text)
+        self.assertIn("V01 | 4.00s | CAN COVER up to 1.3s |", text)             # only her silent reaction
+        busy = call2.cutaway_prompt(audio, video, described, [10], [(0.0, 3.8)])
+        self.assertIn("V01 | 4.00s | cannot cover (a face is talking) |", busy)
+
+    def test_a_short_shot_with_nobody_talking_can_cover_a_short_sound(self):
+        # from a real ad: a 0.68 s product close-up was labelled "cannot cover (a face is talking)"
+        shots = [(0.0, 3.0), (3.0, 3.68), (3.68, 3.9), (3.9, 7.0)]
+        words = [{"start": 0.5, "end": 0.9, "word": "Look."}, {"start": 4.5, "end": 6.5, "word": "longer line"}]
+        audio, video = cut_pieces(shots, words)
+        described, _ = call1.clean({}, audio, video)
+        text = call2.cutaway_prompt(audio, video, described, [4])
+        self.assertIn("V02 | 0.68s | CAN COVER up to 0.7s |", text)
+        self.assertIn("V03 | 0.22s | cannot cover (too short) |", text)
+        look = next(a.id for a in audio if a.text == "Look.")
+        long = next(a.id for a in audio if a.text == "longer line")
+        cut = call2.build_cut(audio, video, described, edit("cutaway", [(look, "V02")], target=1.0))
+        self.assertEqual(cut["stats"]["covers"], {look: "V02"})                 # ~0.5 s of sound fits in 0.68 s
+
+    def test_a_cover_shorter_than_its_sound_is_shown_first_then_the_sounds_own_picture(self):
+        # from a real ad: a 0.68 s close-up of the pack over a ~1 s line that names it
+        shots = [(0.0, 3.0), (3.0, 3.68), (3.68, 7.0)]
+        words = [{"start": 4.5, "end": 5.4, "word": "Hotel Kohinoor."}]
+        audio, video = cut_pieces(shots, words)
+        described, _ = call1.clean({}, audio, video)
+        line = next(a for a in audio if a.text)
+        cut = call2.build_cut(audio, video, described, edit("cutaway", [(line.id, "V02")], target=1.0))
+        self.assertEqual(cut["stats"]["covers"], {line.id: "V02"})
+        cover, own = cut["pieces"]
+        self.assertEqual((cover["units"], cover["video_start"], cover["length"]), (f"{line.id}<-V02", 3.0, 0.68))
+        self.assertAlmostEqual(cover["audio_start"], line.start, places=3)        # the pack as the line starts
+        self.assertAlmostEqual(own["video_start"], line.start + 0.68, places=3)   # then the speaker, in sync
+        self.assertEqual(own["video_start"], own["audio_start"])
+        self.assertAlmostEqual(cover["length"] + own["length"], line.dur, places=3)
+
+    def test_the_tail_left_on_its_own_picture_is_not_reused_as_a_cover(self):
+        shots = [(0.0, 0.7), (0.7, 4.0), (4.0, 8.0)]
+        words = [{"start": 1.0, "end": 3.6, "word": "a long line."}, {"start": 5.0, "end": 6.0, "word": "later."}]
+        audio, video = cut_pieces(shots, words)
+        described, _ = call1.clean({}, audio, video)
+        first = next(a.id for a in audio if a.text == "a long line.")
+        later = next(a.id for a in audio if a.text == "later.")
+        cut = call2.build_cut(audio, video, described, edit("cutaway", [(first, "V01"), (later, "V02")], target=4.0))
+        seen = sorted((p["video_start"], p["video_start"] + p["length"]) for p in cut["pieces"])
+        for a, b in zip(seen, seen[1:]):
+            self.assertGreaterEqual(b[0], a[1] - 1e-6)                            # no footage twice
 
 
 # The case from a real ad: a closing voiceover runs, without a pause, over the last two shots.
@@ -126,6 +168,19 @@ class ParseTest(unittest.TestCase):
         self.assertEqual(list(got), ["15s_synced", "10s_synced"])
         self.assertEqual(got["15s_synced"]["segments"], [{"audio": "A02", "video": ""}, {"audio": "A07", "video": ""}])
         self.assertEqual(got["10s_synced"]["story"], "ten")
+
+    def test_the_story_score_is_read_and_shown(self):
+        raw = {"edits": [{"target_s": 10, "segments": ["S02"], "story": "s", "story_score": 4.4,
+                          "score_reason": "the payoff has no setup"},
+                         {"target_s": 15, "segments": ["S02"], "story": "s", "story_score": 99}]}
+        got = call2.parse(raw, [10, 15, 20], "synced")
+        self.assertEqual((got["10s_synced"]["story_score"], got["10s_synced"]["score_reason"]), (4, "the payoff has no setup"))
+        self.assertEqual(got["15s_synced"]["story_score"], 10)
+        self.assertIsNone(call2.parse({"edits": [{"target_s": 10, "segments": []}]}, [10], "synced")["10s_synced"]["story_score"])
+        audio, video, described, hope, sweater = setup()
+        cut = call2.build_cut(audio, video, described, {**edit("synced", [hope, sweater]), **got["10s_synced"],
+                                                        "segments": [{"audio": hope, "video": ""}]})
+        self.assertIn("story score: 4/10  LOW  the payoff has no setup", call2.report({"x": cut}))
 
     def test_cutaway_segments_and_a_missing_edit(self):
         raw = {"edits": [{"target_s": 10, "segments": [{"audio": "A07", "video": "V03"}], "story": ""}]}
