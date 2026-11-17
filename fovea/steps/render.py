@@ -31,6 +31,7 @@ import pandas as pd
 from ..config import PipelineConfig
 from ..framing import CropGeometry, OutputTarget, find_focal_points_rules, find_focal_points_viterbi, plan_camera
 from ..models.ocr import records_to_df
+from ..framing.subjects import busy_shots, mark_overlays
 from ..models.speakers import attach_speaking_scores
 from ..story.edit import decode_args, encode_args, frame_plan
 from ..utils.jobdir import JobDir
@@ -44,7 +45,16 @@ def _focal(job: JobDir, cfg: PipelineConfig):
     shots = pd.read_csv(job.shots)
     data = merge_shards(job)
     tracks = attach_speaking_scores(data["tracks"], data["speaker_scores"])
-    ocr = records_to_df(data["ocr"])
+    # Before any crop centre is computed: text that sits in the same area in 2+ shots, on top of real picture,
+    # is an overlay (logo / disclaimer). It is marked (column "overlay") and the framing does not use it.
+    text = mark_overlays(data["ocr"], busy_shots(data["tracks"], float(proxy.width * proxy.height)))
+    ocr = records_to_df(text)
+    ocr.to_csv(job.framing_dir / "ocr.csv", index=False)                       # all text, with the mark
+    overlays = [r for r in text if r["overlay"]]
+    pd.DataFrame(overlays, columns=list(ocr.columns)).to_csv(job.framing_dir / "overlays.csv", index=False)
+    if overlays:
+        print(f"  {len(overlays)} text overlay(s) (logo / disclaimer) not used for framing: framing/overlays.csv",
+              flush=True)
 
     # Focal points are found in proxy pixels, then scaled to source pixels
     common = dict(shots_df=shots, shot_tracks=tracks, ocr_df=ocr, motion_results=data["motion"],

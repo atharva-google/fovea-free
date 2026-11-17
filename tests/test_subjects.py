@@ -5,8 +5,8 @@
 
 import unittest
 
-from fovea.framing.subjects import (fill_track_gaps, person_score, shot_motion_cx, speaker_score,
-                                    speaking_frames, watermark_indices)
+from fovea.framing.subjects import (busy_shots, fill_track_gaps, mark_overlays, person_score, shot_motion_cx, speaker_score,
+                                    speaking_frames)
 
 
 def track(tid, scores, shot=0, start=0):
@@ -122,22 +122,50 @@ class GapsTest(unittest.TestCase):
         self.assertEqual(out[26], [])
 
 
-class WatermarkTest(unittest.TestCase):
-    def test_text_in_the_same_corner_in_many_shots_is_a_logo(self):
-        boxes = [(s, 0.10, 0.15) for s in range(8)] + [(3, 0.5, 0.8), (5, 0.52, 0.2)]
-        self.assertEqual(watermark_indices(boxes, n_shots=20), set(range(8)))
+def text(shot, x1, y1, x2, y2):
+    return {"shot_id": shot, "text": "?", "text_box_vertices": [(x1, y1), (x2, y1), (x2, y2), (x1, y2)]}
 
-    def test_text_seen_in_one_or_two_shots_is_kept(self):
-        self.assertEqual(watermark_indices([(0, 0.5, 0.5), (1, 0.5, 0.5), (2, 0.1, 0.9)], n_shots=10), set())
-        self.assertEqual(watermark_indices([], n_shots=10), set())
 
-    def test_three_shots_are_enough_however_long_the_video(self):
-        boxes = [(s, 0.1, 0.1) for s in range(3)]
-        self.assertEqual(watermark_indices(boxes, n_shots=40), {0, 1, 2})
-        self.assertEqual(watermark_indices(boxes[:2], n_shots=40), set())
+LOGO = (0.07, 0.08, 0.15, 0.17)
 
-    def test_the_same_text_twice_in_one_shot_is_not_three_shots(self):
-        self.assertEqual(watermark_indices([(7, 0.1, 0.1)] * 5, n_shots=10), set())
+
+class OverlayTest(unittest.TestCase):
+    def marks(self, records, busy):
+        return [r["overlay"] for r in mark_overlays(records, busy)]
+
+    def test_text_in_the_same_area_in_two_shots_over_real_picture_is_an_overlay(self):
+        records = [text(3, *LOGO), text(9, 0.071, 0.082, 0.151, 0.172), text(9, 0.3, 0.7, 0.7, 0.8)]
+        self.assertEqual(self.marks(records, busy={3, 9}), [True, True, False])
+
+    def test_the_wording_is_not_compared_and_one_busy_shot_is_enough(self):
+        a, b = text(3, *LOGO), text(21, *LOGO)
+        a["text"], b["text"] = "KitKat", "KltKa1"
+        self.assertEqual(self.marks([a, b], busy={3}), [True, True])       # also marked on the end card (21)
+
+    def test_an_end_card_cut_in_two_keeps_its_own_logo(self):
+        records = [text(20, 0.3, 0.3, 0.7, 0.6), text(21, 0.3, 0.3, 0.7, 0.6)]
+        self.assertEqual(self.marks(records, busy={1, 2, 3}), [False, False])
+
+    def test_text_seen_in_one_shot_only_or_only_partly_overlapping_is_kept(self):
+        self.assertEqual(self.marks([text(3, *LOGO), text(3, *LOGO)], busy={3}), [False, False])
+        self.assertEqual(self.marks([text(3, 0.1, 0.1, 0.3, 0.2), text(4, 0.2, 0.1, 0.4, 0.2)], busy={3, 4}),
+                         [False, False])                                    # they share a third of their area
+        self.assertEqual(mark_overlays([], {1}), [])
+
+    def test_the_records_are_marked_not_removed_and_the_input_is_untouched(self):
+        records = [text(3, *LOGO), text(9, *LOGO)]
+        out = mark_overlays(records, {3})
+        self.assertEqual(len(out), 2)
+        self.assertNotIn("overlay", records[0])
+
+    def test_busy_shots_have_a_person_or_a_large_object(self):
+        person = {"cname": "person", "track_id": 1, "bbox": [10, 10, 60, 60]}
+        bars = {"cname": "cell phone", "track_id": 2, "bbox": [186, 24, 1062, 690]}
+        small = {"cname": "cup", "track_id": 3, "bbox": [10, 10, 60, 60]}
+        tracks = {1: {f: [person] for f in range(20)}, 2: {f: [bars] for f in range(20)},
+                  3: {f: [small] for f in range(20)}, 4: {f: [] for f in range(20)},
+                  5: {**{f: [] for f in range(39)}, 39: [person]}}       # one stray frame in 40
+        self.assertEqual(busy_shots(tracks, 1280 * 720.0), {1, 2})
 
 
 class ShotMotionTest(unittest.TestCase):

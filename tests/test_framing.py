@@ -80,6 +80,23 @@ class WhatTheCameraFollowsTest(unittest.TestCase):
         c = extract_frame_candidates(0, 0, {0: [silent, talker]}, {}, {}, W, H)
         self.assertEqual(max(c, key=lambda x: x["score"])["tag"], "speaker_2")
 
+    def test_an_end_card_is_framed_on_all_its_text_together(self):
+        logo = {"cx": 560.0, "box_w": 160.0, "area": 30.0}
+        offer = {"cx": 720.0, "box_w": 160.0, "area": 20.0}
+        c = extract_frame_candidates(0, 0, {}, {0: [logo, offer]}, {}, W, H)
+        self.assertEqual([(x["tag"], x["cx"]) for x in c], [("ocr_text", 640.0)])    # the middle of 480..800
+
+    def test_text_wider_than_a_vertical_crop_is_framed_on_its_largest_box(self):
+        left = {"cx": 200.0, "box_w": 200.0, "area": 10.0}
+        right = {"cx": 1000.0, "box_w": 300.0, "area": 40.0}
+        c = extract_frame_candidates(0, 0, {}, {0: [left, right]}, {}, W, H)
+        self.assertEqual([x["cx"] for x in c], [1000.0])
+
+    def test_text_comes_before_movement_on_an_end_card(self):
+        moving = {0: {"motion_cx": 100.0, "instant_density": 0.5, "motion_weight": 0.5}}
+        c = extract_frame_candidates(0, 0, {}, TEXT, moving, W, H)
+        self.assertEqual([x["type"] for x in c], ["ocr"])
+
     def test_with_nothing_at_all_the_camera_stays_in_the_middle(self):
         c = extract_frame_candidates(5, 0, {}, TEXT, {}, W, H)           # frame 5: no people, no text
         self.assertEqual([(x["type"], x["cx"]) for x in c], [("fallback", W / 2)])

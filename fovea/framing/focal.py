@@ -14,14 +14,14 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 import pandas as pd
 
-from .subjects import fill_track_gaps, person_score, shot_motion_cx, speaker_score, watermark_indices
+from .subjects import fill_track_gaps, person_score, shot_motion_cx, speaker_score
 
 OcrByFrame = Dict[int, List[Dict[str, float]]]
 
 
-def parse_ocr_entries(ocr_df: pd.DataFrame, fps: float, video_w: int, n_shots: Optional[int] = None) -> OcrByFrame:
-    """Expand per-shot OCR rows into a {frame_idx: [boxes]} lookup. Text that sits in the same place in
-    many shots (a logo in a corner) is left out: it is never something to frame."""
+def parse_ocr_entries(ocr_df: pd.DataFrame, fps: float, video_w: int) -> OcrByFrame:
+    """Expand per-shot OCR rows into a {frame_idx: [boxes]} lookup. Rows marked ``overlay`` (a logo or
+    disclaimer, see ``subjects.mark_overlays``) are left out: they are never something to frame."""
 
     def safe_parse_vertices(val):
         if isinstance(val, (list, tuple)):
@@ -36,8 +36,10 @@ def parse_ocr_entries(ocr_df: pd.DataFrame, fps: float, video_w: int, n_shots: O
                     return [(float(x), float(y)) for x, y in matches]
         return []
 
-    parsed = []       # (first frame, last frame, entry, (shot id, centre x 0-1, centre y 0-1))
-    for k, (_, row) in enumerate(ocr_df.iterrows()):
+    ocr_by_frame: OcrByFrame = {}
+    for _, row in ocr_df.iterrows():
+        if "overlay" in row and bool(row["overlay"]):
+            continue
         f_start = int(round(float(row["start_s"]) * fps))
         f_end = int(round(float(row["end_s"]) * fps))
 
@@ -57,14 +59,6 @@ def parse_ocr_entries(ocr_df: pd.DataFrame, fps: float, video_w: int, n_shots: O
             "area": box_w * box_h,
             "confidence": float(row.get("confidence", 1.0)),
         }
-        shot = row["shot_id"] if "shot_id" in row else k
-        parsed.append((f_start, f_end, entry, (shot, entry["cx"] / float(video_w), (min(ys) + max(ys)) / 2.0)))
-
-    logos = watermark_indices([where for _, _, _, where in parsed], n_shots)
-    ocr_by_frame: OcrByFrame = {}
-    for k, (f_start, f_end, entry, _) in enumerate(parsed):
-        if k in logos:
-            continue
         for f in range(f_start, f_end + 1):
             ocr_by_frame.setdefault(f, []).append(entry)
     return ocr_by_frame
@@ -133,12 +127,18 @@ def extract_frame_candidates(
     if candidates:
         return candidates
 
-    # 3. On-screen text (logos that sit in the same place in every shot were removed earlier).
-    #    High for the first ~0.5s of a shot, then it decays once read.
+    # 3. On-screen text, only reached when there is no person and no large object (an end card). Overlays
+    #    (logos, disclaimers) were left out before. One framing for all the text together: the middle of
+    #    it, or the largest box if it is wider than a vertical (9:16) crop.
     if f_idx in ocr_by_frame:
-        read_decay = 1.0 if shot_rel_idx < 12 else max(0.15, 1.0 - (shot_rel_idx - 12) * 0.08)
-        return [{"cx": box["cx"], "score": 0.85 * read_decay, "tag": "ocr_text", "type": "ocr"}
-                for box in ocr_by_frame[f_idx]]
+        boxes = ocr_by_frame[f_idx]
+        left = min(b["cx"] - b.get("box_w", 0.0) / 2.0 for b in boxes)
+        right = max(b["cx"] + b.get("box_w", 0.0) / 2.0 for b in boxes)
+        if right - left <= video_h * 9.0 / 16.0:
+            cx = (left + right) / 2.0
+        else:
+            cx = max(boxes, key=lambda b: b.get("area", 0.0))["cx"]
+        return [{"cx": cx, "score": 0.85, "tag": "ocr_text", "type": "ocr"}]
 
     # 4. Movement: strong movement on this frame, else where the whole shot moves.
     motion = motion_results.get(f_idx, {})
@@ -233,7 +233,7 @@ def find_focal_points_viterbi(
     max_jump_cost: float = 4.0,
     switch_penalty: float = 1.2,
 ) -> pd.DataFrame:
-    ocr_by_frame = parse_ocr_entries(ocr_df, fps, video_width, n_shots=len(shots_df))
+    ocr_by_frame = parse_ocr_entries(ocr_df, fps, video_width)
     records = []
     for _, shot in shots_df.iterrows():
         s_id = int(shot["shot_id"])

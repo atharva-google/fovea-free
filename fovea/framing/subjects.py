@@ -12,8 +12,8 @@ background face was enough to pull the camera. Here a face counts as speaking on
   * the face is not small next to the largest face on screen (people behind the subject)
 
 The rest of this file is the per-shot preparation the framing does before it picks a path:
-holding people through frames where the detector lost them, ignoring a logo that sits in the same
-corner in every shot, and finding where the movement of a whole shot is.
+holding people through frames where the detector lost them, marking text overlays (a logo or
+disclaimer that sits in the same place in several shots), and finding where a whole shot moves.
 """
 
 
@@ -138,19 +138,57 @@ def fill_track_gaps(frames_data, shot_frames, max_gap=25):
     return out
 
 
-def watermark_indices(boxes, n_shots=None, tol=0.04, min_shots=3, min_share=0.0):
-    """Text that sits in the same place in many shots is a logo / watermark, not something to look at.
+def _box(vertices):
+    xs, ys = [float(v[0]) for v in vertices], [float(v[1]) for v in vertices]
+    return (min(xs), min(ys), max(xs), max(ys))
 
-    ``boxes``: ``[(shot_id, cx, cy)]`` with the centre of each text box as a share of the frame (0-1).
-    Returns the indices of the boxes to ignore."""
-    shots = {s for s, _, _ in boxes}
-    need = max(min_shots, int(min_share * max(n_shots or 0, len(shots)) + 0.999))
-    drop = set()
-    for i, (_, x, y) in enumerate(boxes):
-        same_place = {s for s, x2, y2 in boxes if abs(x2 - x) <= tol and abs(y2 - y) <= tol}
-        if len(same_place) >= need:
-            drop.add(i)
-    return drop
+
+def _iou(a, b):
+    ix = max(0.0, min(a[2], b[2]) - max(a[0], b[0]))
+    iy = max(0.0, min(a[3], b[3]) - max(a[1], b[1]))
+    union = (a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - ix * iy
+    return ix * iy / union if union > 0 else 0.0
+
+
+def mark_overlays(text_records, busy_shots, min_iou=0.5):
+    """Mark on-screen text that is an overlay (a logo, a disclaimer, a watermark): ``record["overlay"]``.
+
+    A text box is an overlay when a box in a DIFFERENT shot covers the same area (the two overlap by
+    at least ``min_iou`` of their combined area; the wording is not compared) and at least one of
+    those shots is "busy" (has a person or a large object), i.e. the text sits on top of real picture.
+    Text that only repeats across shots with nothing else in them (an end card cut in two) is not.
+    Overlays are never used for framing. Returns copies of the records, in the same order."""
+    busy = {int(s) for s in busy_shots}
+    boxes = []
+    for r in text_records:
+        v = r.get("text_box_vertices") or []
+        boxes.append((int(r["shot_id"]), _box(v)) if len(v) >= 2 else None)
+    out = []
+    for i, r in enumerate(text_records):
+        overlay = False
+        if boxes[i] is not None:
+            shot, box = boxes[i]
+            twins = [o[0] for j, o in enumerate(boxes) if j != i and o is not None and o[0] != shot
+                     and _iou(box, o[1]) >= min_iou]
+            overlay = bool(twins) and (shot in busy or any(s in busy for s in twins))
+        out.append({**r, "overlay": overlay})
+    return out
+
+
+def busy_shots(shot_tracks, frame_area, min_object=0.05):
+    """Shots that show a person or a large object (``min_object`` of the frame) on at least a tenth of
+    their frames. The other shots have "nothing else": only there may text be framed (an end card)."""
+    busy = set()
+    for shot, frames in shot_tracks.items():
+        hits = 0
+        for dets in frames.values():
+            if any(d.get("cname") == "person" or
+                   (d["bbox"][2] - d["bbox"][0]) * (d["bbox"][3] - d["bbox"][1]) >= min_object * frame_area
+                   for d in dets):
+                hits += 1
+        if frames and hits >= max(1, 0.1 * len(frames)):
+            busy.add(int(shot))
+    return busy
 
 
 def shot_motion_cx(motion_results, shot_frames, min_density=0.05, min_share=0.2):
