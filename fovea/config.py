@@ -146,6 +146,7 @@ class PipelineConfig:
     cut_modes: List[str] = field(default_factory=lambda: ["synced", "cutaway"])
     gemini_framing: bool = False  # optional extra Gemini call: let it correct our focal point per shot
     cut_brain: str = "gemini"    # who builds the edit: "gemini" (two calls: describe, then edit) | "code" (story map + selector)
+    edit_thinking: str = "low"   # call 2: how much Gemini may reason first: minimal | low | medium | high | "" (its default, slowest)
     refresh_edits: bool = False  # gemini brain: ask call 2 again even if an edit is stored for this length and mode
     cut_params: Dict[str, Any] = field(default_factory=dict)  # selector settings (fovea/story/select.py), e.g. {"cut_penalty": 1}
 
@@ -172,6 +173,8 @@ class PipelineConfig:
             raise ValueError("cut_durations must be positive numbers of seconds")
         if not self.cut_modes or any(m not in ("synced", "cutaway") for m in self.cut_modes):
             raise ValueError("cut_modes must be 'synced' and/or 'cutaway'")
+        if self.edit_thinking not in ("", "minimal", "low", "medium", "high"):
+            raise ValueError("edit_thinking must be minimal, low, medium, high or empty (the model's default)")
         if self.cut_brain not in ("gemini", "code"):
             raise ValueError("cut_brain must be 'gemini' or 'code'")
         self.detect_every = max(1, int(self.detect_every))

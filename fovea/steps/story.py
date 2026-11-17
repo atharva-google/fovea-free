@@ -219,7 +219,7 @@ def plan_edits(job: JobDir, cfg: PipelineConfig, described: Dict[str, Any], api_
 
         with ThreadPoolExecutor(max_workers=len(todo), thread_name_prefix="call2") as pool:
             jobs = [(mode, pool.submit(call2.request, audio, video, desc, missing, mode, api_key, cfg.gemini_model,
-                                       cfg.gemini_api_version, log, talk)) for mode, missing in todo]
+                                       cfg.gemini_api_version, log, talk, cfg.edit_thinking)) for mode, missing in todo]
             for mode, job_ in jobs:
                 try:
                     stored.update(job_.result())

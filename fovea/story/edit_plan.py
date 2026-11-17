@@ -212,9 +212,14 @@ def _fill(template: str, described: Dict[str, Any], all_shots: List[VideoUnit], 
 # =========================================================================== the Gemini call
 def request(audio: List[AudioUnit], video: List[VideoUnit], described: Dict[str, Any], targets: Sequence[float],
             mode: str, api_key: str, model: str = "gemini-3.8-flash", api_version: str = "v1beta",
-            log: Callable[[str], None] = print, talk: Sequence[Span] = ()) -> Dict[str, Dict[str, Any]]:
+            log: Callable[[str], None] = print, talk: Sequence[Span] = (),
+            thinking: str = "") -> Dict[str, Dict[str, Any]]:
     """One text-only request for ``mode``. Returns ``{"15s_synced": {"target_s", "mode", "segments",
-    "story", "model"}}`` with ``segments`` as ``[{"audio", "video"}]`` in both modes."""
+    "story", "model"}}`` with ``segments`` as ``[{"audio", "video"}]`` in both modes.
+
+    ``thinking``: how much the model may reason before answering: "minimal", "low", "medium", "high",
+    or "" for the model's own default (the slowest: it reasoned for minutes on this task). If the
+    model rejects the setting, the request is sent once more without it."""
     if mode not in MODES:
         raise ValueError(f"mode must be one of {MODES}")
     if not api_key:
@@ -234,12 +239,27 @@ def request(audio: List[AudioUnit], video: List[VideoUnit], described: Dict[str,
     if api_version:
         http["api_version"] = api_version
     client = genai.Client(api_key=api_key, http_options=types.HttpOptions(**http))
-    log(f"  call 2 ({mode}): asking {model} for {', '.join(f'{t:g}s' for t in targets)}")
+    base = dict(response_mime_type="application/json", response_schema=schema)
+    limited = dict(base)
+    if thinking and hasattr(types, "ThinkingConfig"):
+        try:
+            limited["thinking_config"] = types.ThinkingConfig(thinking_level=thinking)
+        except Exception:  # noqa: BLE001 - an older google-genai without thinking levels
+            log(f"  call 2 ({mode}): this google-genai version has no thinking levels; using the model's default")
+    log(f"  call 2 ({mode}): asking {model} for {', '.join(f'{t:g}s' for t in targets)}"
+        f" (thinking: {thinking if 'thinking_config' in limited else 'model default'})")
     try:
         t0 = time.time()
-        resp = client.models.generate_content(
-            model=model, contents=[text],
-            config=types.GenerateContentConfig(response_mime_type="application/json", response_schema=schema))
+        try:
+            resp = client.models.generate_content(model=model, contents=[text],
+                                                  config=types.GenerateContentConfig(**limited))
+        except Exception as e:  # noqa: BLE001
+            if "thinking_config" not in limited or "thinking" not in str(e).lower():
+                raise
+            log(f"  call 2 ({mode}): {model} does not accept thinking={thinking!r}; asking again with its default")
+            t0 = time.time()
+            resp = client.models.generate_content(model=model, contents=[text],
+                                                  config=types.GenerateContentConfig(**base))
         usage = getattr(resp, "usage_metadata", None)
         log(f"  call 2 ({mode}) answered in {time.time() - t0:.1f}s | tokens in={getattr(usage, 'prompt_token_count', None)} "
             f"out={getattr(usage, 'candidates_token_count', None)} "
